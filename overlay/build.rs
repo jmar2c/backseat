@@ -2,16 +2,41 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rustc-link-lib=vpx");
     println!("cargo:rerun-if-changed=build.rs");
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // Collect any extra include paths needed for bindgen (populated on Windows via vcpkg).
+    let include_paths: Vec<PathBuf> = if target_os == "windows" {
+        // Let the `vcpkg` crate find libvpx and emit the correct rustc-link-* directives.
+        // Requires: vcpkg install libvpx:x64-windows && vcpkg integrate install
+        let lib = vcpkg::probe_package("libvpx").unwrap_or_else(|e| {
+            panic!(
+                "Could not find libvpx via vcpkg: {e}\n\
+                 Run: vcpkg install libvpx:x64-windows && vcpkg integrate install"
+            )
+        });
+        lib.include_paths
+    } else {
+        println!("cargo:rustc-link-lib=vpx");
+        vec![]
+    };
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header_contents(
             "wrapper.h",
-            "#include <vpx/vpx_encoder.h>\n#include <vpx/vp8cx.h>\n#include <vpx/vpx_decoder.h>\n#include <vpx/vp8dx.h>\n",
-        )
+            "#include <vpx/vpx_encoder.h>\n#include <vpx/vp8cx.h>\n\
+             #include <vpx/vpx_decoder.h>\n#include <vpx/vp8dx.h>\n",
+        );
+
+    // Point bindgen at the vcpkg-installed headers on Windows.
+    for path in &include_paths {
+        builder = builder.clang_arg(format!("-I{}", path.display()));
+    }
+
+    builder
         .allowlist_function("vpx_codec_vp8_cx")
         .allowlist_function("vpx_codec_enc_config_default")
         .allowlist_function("vpx_codec_enc_init_ver")
