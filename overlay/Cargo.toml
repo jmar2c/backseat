@@ -1,0 +1,28 @@
+[package]
+name = "overlay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+eframe = { version = "0.27", features = ["default_fonts"] }
+egui = "0.27"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+scrap = "0.5"
+
+[build-dependencies]
+bindgen = "0.72"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Needed for transparent click-through windows on Windows
+winapi = { version = "0.3", features = ["winuser", "wingdi"] }
+tray-icon = "0.14"
