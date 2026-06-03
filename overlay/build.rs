@@ -10,12 +10,15 @@ fn main() {
     let include_paths: Vec<PathBuf> = if target_os == "windows" {
         // Let the `vcpkg` crate find libvpx and emit the correct rustc-link-* directives.
         // Requires: vcpkg install libvpx:x64-windows && vcpkg integrate install
-        let lib = vcpkg::probe_package("libvpx").unwrap_or_else(|e| {
-            panic!(
-                "Could not find libvpx via vcpkg: {e}\n\
-                 Run: vcpkg install libvpx:x64-windows && vcpkg integrate install"
-            )
-        });
+        let lib = vcpkg::Config::new()
+            .lib_name("vpx")
+            .probe("libvpx")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Could not find libvpx via vcpkg: {e}\n\
+                     Run: vcpkg install libvpx:x64-windows-static-md && vcpkg integrate install"
+                )
+            });
         lib.include_paths
     } else {
         println!("cargo:rustc-link-lib=vpx");
