@@ -76,7 +76,7 @@ impl Vp8Encoder {
         unsafe {
             self.fill_i420(bgra);
 
-            let flags = if force_keyframe { VPX_EFLAG_FORCE_KF as i64 } else { 0i64 };
+            let flags = if force_keyframe { VPX_EFLAG_FORCE_KF as _ } else { 0 };
 
             let err = vpx_codec_encode(
                 &mut self.ctx,
@@ -84,7 +84,7 @@ impl Vp8Encoder {
                 self.pts,
                 1,
                 flags,
-                VPX_DL_REALTIME as u64,
+                VPX_DL_REALTIME as _,
             );
             self.pts += 3_000; // 90_000 Hz / 30 fps
 
