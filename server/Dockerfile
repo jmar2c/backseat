@@ -11,7 +11,9 @@ COPY overlay/Cargo.toml overlay/Cargo.toml
 
 # Stub the server source so cargo can compile all dependencies without real code.
 # This layer is cached as long as the manifests don't change.
-RUN mkdir -p server/src && echo 'fn main(){}' > server/src/main.rs
+RUN mkdir -p server/src overlay/src \
+ && echo 'fn main(){}' > server/src/main.rs \
+ && echo 'fn main(){}' > overlay/src/main.rs
 RUN cargo build --release -p backseat-server
 
 # Copy real source and rebuild — only the server crate recompiles.
