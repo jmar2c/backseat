@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,23 +22,25 @@ struct RgbaFrame { width: u32, height: u32, data: Vec<u8> }
 
 /// Payload sent from the async host setup task back to the egui thread once ready.
 struct HostReady {
-    transport:  Arc<Transport>,
-    room_code:  String,  // WAN / STUN-discovered address
-    local_code: String,  // LAN IP address (same port)
-    annot_rx:   mpsc::UnboundedReceiver<AnnotMsg>,
-    cursors:    Arc<Mutex<CursorState>>,
-    draws:      Arc<Mutex<DrawLayer>>,
+    transport:   Arc<Transport>,
+    room_code:   String,  // WAN / STUN-discovered address
+    local_code:  String,  // LAN IP address (same port)
+    annot_rx:    mpsc::UnboundedReceiver<AnnotMsg>,
+    cursors:     Arc<Mutex<CursorState>>,
+    draws:       Arc<Mutex<DrawLayer>>,
+    capture_ok:  Arc<AtomicBool>, // false when screen capture is consistently failing
 }
 
 /// Live state held while in host mode.
 struct HostCtx {
-    room_code:  String,
-    local_code: String,
-    _transport: Arc<Transport>, // keeps the socket alive for the duration of hosting
-    annot_rx:   mpsc::UnboundedReceiver<AnnotMsg>,
-    cursors:    Arc<Mutex<CursorState>>,
-    draws:      Arc<Mutex<DrawLayer>>,
-    tray:       crate::tray::HostTray,
+    room_code:   String,
+    local_code:  String,
+    _transport:  Arc<Transport>, // keeps the socket alive for the duration of hosting
+    annot_rx:    mpsc::UnboundedReceiver<AnnotMsg>,
+    cursors:     Arc<Mutex<CursorState>>,
+    draws:       Arc<Mutex<DrawLayer>>,
+    tray:        crate::tray::HostTray,
+    capture_ok:  Arc<AtomicBool>,
 }
 
 /// Payload sent from the async join setup task back to the egui thread once ready.
@@ -129,13 +132,14 @@ impl OverlayApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                         let tray = crate::tray::HostTray::new(ready.room_code.clone());
                         State::Hosting(HostCtx {
-                            room_code:  ready.room_code,
-                            local_code: ready.local_code,
-                            _transport: ready.transport,
-                            annot_rx:   ready.annot_rx,
-                            cursors:    ready.cursors,
-                            draws:      ready.draws,
+                            room_code:   ready.room_code,
+                            local_code:  ready.local_code,
+                            _transport:  ready.transport,
+                            annot_rx:    ready.annot_rx,
+                            cursors:     ready.cursors,
+                            draws:       ready.draws,
                             tray,
+                            capture_ok:  ready.capture_ok,
                         })
                     }
                     Err(_) => State::Discovering { rx },
@@ -162,6 +166,12 @@ impl OverlayApp {
                     .title_bar(false)
                     .show(ctx, |ui| {
                         ui.label(egui::RichText::new("backseat — hosting").strong());
+                        if !h.capture_ok.load(Ordering::Relaxed) {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 120, 60),
+                                "⚠ screen capture failing\nRun in physical desktop session\n(not via remote desktop)",
+                            );
+                        }
                         ui.separator();
                         let loopback = format!("127.0.0.1:{}", h.room_code.split(':').last().unwrap_or("?"));
                         ui.horizontal(|ui| {
@@ -347,8 +357,9 @@ impl OverlayApp {
             tracing::info!("room code (WAN): {room_code}");
             tracing::info!("room code (LAN): {local_code}");
 
-            let cursors = Arc::new(Mutex::new(CursorState::default()));
-            let draws   = Arc::new(Mutex::new(DrawLayer::default()));
+            let cursors     = Arc::new(Mutex::new(CursorState::default()));
+            let draws       = Arc::new(Mutex::new(DrawLayer::default()));
+            let capture_ok  = Arc::new(AtomicBool::new(true));
             let (annot_tx, annot_rx) = mpsc::unbounded_channel::<AnnotMsg>();
             // _dummy holds the initial broadcast receiver so the channel isn't
             // immediately considered closed before the transport task subscribes.
@@ -356,29 +367,78 @@ impl OverlayApp {
 
             // Screen capture + VP8 encode thread.
             {
-                let tx = frame_tx.clone();
+                let tx          = frame_tx.clone();
+                let capture_ok  = Arc::clone(&capture_ok);
                 std::thread::spawn(move || {
                     let mut cap = match ScreenCapture::new() {
                         Ok(c)  => c,
-                        Err(e) => { tracing::warn!("screen capture unavailable: {e}"); return; }
+                        Err(e) => {
+                            tracing::error!("screen capture unavailable: {e}");
+                            capture_ok.store(false, Ordering::Relaxed);
+                            return;
+                        }
                     };
                     let mut enc = match Vp8Encoder::new(cap.width as u32, cap.height as u32, 4_000) {
                         Ok(e)  => e,
                         Err(e) => { tracing::warn!("encoder init failed: {e}"); return; }
                     };
                     tracing::info!("capture thread started {}x{}", cap.width, cap.height);
-                    let mut n = 0u64;
+                    let mut n              = 0u64;
+                    let mut consec_errors  = 0u32;
+                    let mut enc_w          = cap.width;
+                    let mut enc_h          = cap.height;
                     loop {
                         let t = std::time::Instant::now();
-                        if let Some(bgra) = cap.capture() {
-                            if let Some(encoded) = enc.encode(&bgra, n % 150 == 0) {
-                                if n == 0 { tracing::info!("first encoded frame {} bytes", encoded.len()); }
-                                if n % 150 == 0 { tracing::debug!("encode frame {n} → {} bytes", encoded.len()); }
-                                let _ = tx.send(Arc::new(encoded));
-                            } else if n % 150 == 0 {
-                                tracing::warn!("encode returned None at frame {n}");
+                        match cap.capture() {
+                            Ok(Some(bgra)) => {
+                                if consec_errors > 0 {
+                                    tracing::info!("capture recovered after {consec_errors} errors");
+                                    capture_ok.store(true, Ordering::Relaxed);
+                                    consec_errors = 0;
+                                }
+                                if let Some(encoded) = enc.encode(&bgra, n % 150 == 0) {
+                                    if n == 0 { tracing::info!("first encoded frame {} bytes", encoded.len()); }
+                                    if n % 150 == 0 { tracing::debug!("encode frame {n} → {} bytes", encoded.len()); }
+                                    let _ = tx.send(Arc::new(encoded));
+                                } else if n % 150 == 0 {
+                                    tracing::warn!("encode returned None at frame {n}");
+                                }
+                                n += 1;
                             }
-                            n += 1;
+                            Ok(None) => {} // WouldBlock — no new frame yet
+                            Err(e) => {
+                                consec_errors += 1;
+                                if consec_errors == 1 {
+                                    tracing::warn!("capture error: {e}");
+                                }
+                                // After ~1 s of consecutive errors, try reinitialising the capturer.
+                                // This recovers from display resolution changes (e.g. Chrome Remote
+                                // Desktop resizing the screen when a client connects).
+                                if consec_errors == 30 {
+                                    tracing::info!("reinitialising capturer after {consec_errors} errors");
+                                    match ScreenCapture::new() {
+                                        Ok(new_cap) => {
+                                            let (nw, nh) = (new_cap.width, new_cap.height);
+                                            cap = new_cap;
+                                            // Rebuild encoder if resolution changed.
+                                            if nw != enc_w || nh != enc_h {
+                                                tracing::info!("resolution changed {enc_w}x{enc_h} → {nw}x{nh}, rebuilding encoder");
+                                                match Vp8Encoder::new(nw as u32, nh as u32, 4_000) {
+                                                    Ok(new_enc) => { enc = new_enc; enc_w = nw; enc_h = nh; n = 0; }
+                                                    Err(e) => tracing::warn!("encoder rebuild failed: {e}"),
+                                                }
+                                            }
+                                            consec_errors = 0;
+                                            capture_ok.store(true, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("capturer reinit failed: {e}");
+                                            capture_ok.store(false, Ordering::Relaxed);
+                                            consec_errors = 0; // reset so we retry again in ~1 s
+                                        }
+                                    }
+                                }
+                            }
                         }
                         let elapsed = t.elapsed();
                         let target  = Duration::from_millis(33);
@@ -437,7 +497,7 @@ impl OverlayApp {
                 });
             }
 
-            let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws });
+            let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws, capture_ok });
         });
         State::Discovering { rx }
     }
