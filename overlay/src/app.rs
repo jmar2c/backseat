@@ -811,7 +811,7 @@ fn apply_annot(msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mu
 /// Base URL of the rendezvous server.  Override at runtime with `BACKSEAT_SERVER`
 /// (useful for self-hosting or local dev).  Update this constant before shipping
 /// a release build once the server is deployed.
-const SERVER_URL: &str = "https://backseat-server.fly.dev";
+const SERVER_URL: &str = "https://backseat.fly.dev";
 
 fn server_url() -> Option<String> {
     let url = std::env::var("BACKSEAT_SERVER").unwrap_or_else(|_| SERVER_URL.to_string());
