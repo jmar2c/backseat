@@ -808,11 +808,14 @@ fn apply_annot(msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mu
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns the rendezvous server base URL from the `BACKSEAT_SERVER` environment
-/// variable (e.g. `https://backseat.fly.dev`).  Returns `None` if not set, which
-/// disables signaling and falls back to direct IP:port mode.
+/// Base URL of the rendezvous server.  Override at runtime with `BACKSEAT_SERVER`
+/// (useful for self-hosting or local dev).  Update this constant before shipping
+/// a release build once the server is deployed.
+const SERVER_URL: &str = "https://backseat-server.fly.dev";
+
 fn server_url() -> Option<String> {
-    std::env::var("BACKSEAT_SERVER").ok()
+    let url = std::env::var("BACKSEAT_SERVER").unwrap_or_else(|_| SERVER_URL.to_string());
+    if url.is_empty() { None } else { Some(url) }
 }
 
 // ── eframe integration ────────────────────────────────────────────────────────

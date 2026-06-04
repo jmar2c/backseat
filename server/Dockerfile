@@ -5,7 +5,7 @@ WORKDIR /build
 
 # Copy workspace manifest + server crate manifest.
 # overlay/Cargo.toml is needed for workspace resolution but overlay is never compiled.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY server/Cargo.toml  server/Cargo.toml
 COPY overlay/Cargo.toml overlay/Cargo.toml
 

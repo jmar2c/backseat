@@ -1,0 +1,7 @@
+target/
+.env
+.git/
+client/
+*.swp
+.DS_Store
+Thumbs.db
