@@ -1,24 +1,23 @@
-# Backseat rendezvous server — deployed to Fly.io.
-# Run from the repo root: fly deploy
+# fly.toml app configuration file generated for backseat on 2026-06-04T18:36:18Z
 #
-# First-time setup:
-#   fly launch --no-deploy   (creates the app, updates the name below)
-#   fly deploy
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app            = "backseat-server"   # replace with your chosen app name after fly launch
-primary_region = "iad"               # US East — change to whichever region is closest to you
+app = 'backseat'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "server/Dockerfile"   # build context is repo root (same dir as this file)
+  dockerfile = 'server/Dockerfile'
 
 [http_service]
-  internal_port       = 3000
-  force_https         = true
-  auto_stop_machines  = false        # must stay alive — cold starts break the 60 s long-poll
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
 [[vm]]
-  memory   = "256mb"
-  cpu_kind = "shared"
-  cpus     = 1
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
