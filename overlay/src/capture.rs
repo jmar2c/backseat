@@ -18,10 +18,11 @@ impl ScreenCapture {
     pub fn new() -> Result<Self, String> {
         let screens = Screen::all()
             .map_err(|e| format!("display enumeration failed: {e}"))?;
-        let screen = screens
-            .into_iter()
+        let screen = screens.iter()
             .find(|s| s.display_info.is_primary)
-            .ok_or_else(|| "no primary display found".to_string())?;
+            .or_else(|| screens.first())
+            .copied()
+            .ok_or_else(|| "no displays found".to_string())?;
 
         // Probe once so width/height reflect actual pixel dimensions, not logical units.
         let probe  = screen.capture().map_err(|e| format!("initial capture failed: {e}"))?;
