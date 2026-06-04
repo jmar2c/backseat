@@ -28,7 +28,9 @@ struct HostReady {
     annot_rx:    mpsc::UnboundedReceiver<AnnotMsg>,
     cursors:     Arc<Mutex<CursorState>>,
     draws:       Arc<Mutex<DrawLayer>>,
-    capture_ok:  Arc<AtomicBool>, // false when screen capture is consistently failing
+    capture_ok:  Arc<AtomicBool>,
+    /// Updated in-place by the signaling task when the room code is refreshed.
+    live_code:   Arc<Mutex<String>>,
 }
 
 /// Live state held while in host mode.
@@ -41,6 +43,7 @@ struct HostCtx {
     draws:       Arc<Mutex<DrawLayer>>,
     tray:        crate::tray::HostTray,
     capture_ok:  Arc<AtomicBool>,
+    live_code:   Arc<Mutex<String>>,
 }
 
 /// Payload sent from the async join setup task back to the egui thread once ready.
@@ -140,6 +143,7 @@ impl OverlayApp {
                             draws:       ready.draws,
                             tray,
                             capture_ok:  ready.capture_ok,
+                            live_code:   ready.live_code,
                         })
                     }
                     Err(_) => State::Discovering { rx },
@@ -173,19 +177,19 @@ impl OverlayApp {
                             );
                         }
                         ui.separator();
-                        let loopback = format!("127.0.0.1:{}", h.room_code.split(':').last().unwrap_or("?"));
-                        ui.horizontal(|ui| {
-                            ui.label("Same machine:");
-                            ui.monospace(&loopback);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("LAN:");
-                            ui.monospace(&h.local_code);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("WAN:");
-                            ui.monospace(&h.room_code);
-                        });
+                        let current_code = h.live_code.lock().unwrap().clone();
+                        let is_short = current_code.len() == 6 && current_code.chars().all(|c| c.is_ascii_uppercase());
+                        if is_short {
+                            ui.horizontal(|ui| {
+                                ui.label("Code:");
+                                ui.monospace(&current_code);
+                            });
+                        } else {
+                            let loopback = format!("127.0.0.1:{}", current_code.split(':').last().unwrap_or("?"));
+                            ui.horizontal(|ui| { ui.label("Same machine:"); ui.monospace(&loopback); });
+                            ui.horizontal(|ui| { ui.label("LAN:"); ui.monospace(&h.local_code); });
+                            ui.horizontal(|ui| { ui.label("WAN:"); ui.monospace(&current_code); });
+                        }
                     });
 
                 egui::CentralPanel::default()
@@ -545,33 +549,56 @@ impl OverlayApp {
                 });
             }
 
-            // If registered with the rendezvous server, wait for a viewer to join.
-            // When they do, push their address to the transport task via peer_hint_tx.
+
+            let live_code = Arc::new(Mutex::new(room_code.clone()));
+            let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws, capture_ok, live_code: Arc::clone(&live_code) });
+
+            // Keep re-registering with the signaling server after each timeout so the
+            // host always has a valid room code without requiring a restart.
             if use_signaling {
-                let code   = room_code.clone();
                 tokio::spawn(async move {
-                    if let Some(server) = server_url() {
-                        match reqwest::Client::new()
-                            .get(format!("{server}/room/{code}/await"))
-                            .timeout(Duration::from_secs(65))
-                            .send().await
-                        {
-                            Ok(resp) if resp.status().is_success() => {
-                                if let Ok(v) = resp.json::<serde_json::Value>().await {
-                                    if let Some(addr_str) = v["peer"].as_str() {
-                                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                                            let _ = peer_hint_tx.send(addr);
+                    loop {
+                        // Re-register to get a fresh code (previous room expired).
+                        if let Some(server) = server_url() {
+                            let body = serde_json::json!({ "udp": wan_addr.to_string() });
+                            match reqwest::Client::new()
+                                .post(format!("{server}/host"))
+                                .json(&body)
+                                .send().await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                        if let Some(code) = v["code"].as_str() {
+                                            tracing::info!("signaling new room code: {code}");
+                                            *live_code.lock().unwrap() = code.to_string();
+
+                                            // Wait for a viewer on this new code.
+                                            match reqwest::Client::new()
+                                                .get(format!("{server}/room/{code}/await"))
+                                                .timeout(Duration::from_secs(305))
+                                                .send().await
+                                            {
+                                                Ok(resp) if resp.status().is_success() => {
+                                                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                                        if let Some(addr_str) = v["peer"].as_str() {
+                                                            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                                                                let _ = peer_hint_tx.send(addr);
+                                                                return; // connected, done
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                _ => {} // timeout or error — loop and re-register
+                                            }
                                         }
                                     }
                                 }
+                                _ => { tokio::time::sleep(Duration::from_secs(5)).await; }
                             }
-                            _ => tracing::warn!("rendezvous /await failed or timed out"),
                         }
                     }
                 });
             }
-
-            let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws, capture_ok });
         });
         State::Discovering { rx }
     }

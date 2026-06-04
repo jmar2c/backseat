@@ -94,7 +94,7 @@ async fn handle_await(
         room.peer_rx.take().ok_or(StatusCode::CONFLICT)? // CONFLICT = already waiting
     };
 
-    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+    match tokio::time::timeout(Duration::from_secs(300), rx).await {
         Ok(Ok(peer_addr)) => {
             s.rooms.lock().unwrap().remove(&code);
             tracing::info!("room {code}: peer joined, both parties notified");
