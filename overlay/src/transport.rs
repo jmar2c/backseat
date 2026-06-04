@@ -33,9 +33,9 @@ pub enum Packet {
 }
 
 impl Transport {
-    /// Bind to an ephemeral port on all interfaces.
+    /// Bind to the fixed backseat port on all interfaces.
     pub async fn bind() -> Result<Self, String> {
-        UdpSocket::bind("0.0.0.0:0")
+        UdpSocket::bind("0.0.0.0:47474")
             .await
             .map(|s| Self { socket: Arc::new(s) })
             .map_err(|e| e.to_string())
