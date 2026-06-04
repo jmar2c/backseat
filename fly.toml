@@ -1,0 +1,24 @@
+# Backseat rendezvous server — deployed to Fly.io.
+# Run from the repo root: fly deploy
+#
+# First-time setup:
+#   fly launch --no-deploy   (creates the app, updates the name below)
+#   fly deploy
+
+app            = "backseat-server"   # replace with your chosen app name after fly launch
+primary_region = "iad"               # US East — change to whichever region is closest to you
+
+[build]
+  dockerfile = "server/Dockerfile"   # build context is repo root (same dir as this file)
+
+[http_service]
+  internal_port       = 3000
+  force_https         = true
+  auto_stop_machines  = false        # must stay alive — cold starts break the 60 s long-poll
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1

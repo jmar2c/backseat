@@ -1,5 +1,5 @@
 [workspace]
-members = ["overlay"]
+members = ["overlay", "server"]
 resolver = "2"
 
 [workspace.dependencies]

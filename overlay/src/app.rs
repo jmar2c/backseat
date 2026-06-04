@@ -12,7 +12,7 @@ use crate::cursor::CursorState;
 use crate::decoder::Vp8Decoder;
 use crate::draw_layer::DrawLayer;
 use crate::encoder::Vp8Encoder;
-use crate::transport::{Packet, Reassembler, Transport};
+use crate::transport::{Packet, Reassembler, RoomCode, Transport};
 use crate::types::{AnnotMsg, NormPoint, UserColor, UserId, UserInfo};
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -234,12 +234,14 @@ impl OverlayApp {
                 if go_back { return State::ChoosingMode; }
                 if go_connect && connect_rx.is_none() {
                     match Transport::parse_room_code(&input) {
-                        Some(host_addr) => {
-                            let rx = self.begin_join(host_addr);
+                        Some(code) => {
+                            let rx = self.begin_join(code);
                             return State::EnteringCode { input, error: None, connect_rx: Some(rx) };
                         }
                         None => return State::EnteringCode {
-                            input, error: Some("Invalid room code (expected IP:port)".into()), connect_rx: None,
+                            input,
+                            error: Some("Invalid room code (expected 6-letter code or IP:port)".into()),
+                            connect_rx: None,
                         },
                     }
                 }
@@ -345,15 +347,47 @@ impl OverlayApp {
 
             let public_addr = transport.public_addr().await;
             let local_port  = transport.socket.local_addr().map(|a| a.port()).unwrap_or(0);
-            let room_addr   = public_addr.unwrap_or_else(|| {
+            let wan_addr    = public_addr.unwrap_or_else(|| {
                 let ip = crate::transport::discover_lan_ip()
                     .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
                 SocketAddr::new(ip, local_port)
             });
-            let room_code = Transport::room_code(room_addr);
             let lan_ip = crate::transport::discover_lan_ip()
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
             let local_code = Transport::room_code(std::net::SocketAddr::new(lan_ip, local_port));
+
+            // Try to register with the rendezvous server for a short room code.
+            // Falls back to the WAN IP:port if the server is unavailable.
+            let (room_code, use_signaling) = match server_url() {
+                Some(server) => {
+                    let body = serde_json::json!({ "udp": wan_addr.to_string() });
+                    match reqwest::Client::new()
+                        .post(format!("{server}/host"))
+                        .json(&body)
+                        .send().await
+                        .and_then(|r| Ok(r))
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                if let Some(code) = v["code"].as_str() {
+                                    tracing::info!("signaling room code: {code}");
+                                    (code.to_string(), true)
+                                } else {
+                                    (Transport::room_code(wan_addr), false)
+                                }
+                            } else {
+                                (Transport::room_code(wan_addr), false)
+                            }
+                        }
+                        _ => {
+                            tracing::warn!("rendezvous server unreachable, falling back to IP:port");
+                            (Transport::room_code(wan_addr), false)
+                        }
+                    }
+                }
+                None => (Transport::room_code(wan_addr), false),
+            };
+
             tracing::info!("room code (WAN): {room_code}");
             tracing::info!("room code (LAN): {local_code}");
 
@@ -364,6 +398,8 @@ impl OverlayApp {
             // _dummy holds the initial broadcast receiver so the channel isn't
             // immediately considered closed before the transport task subscribes.
             let (frame_tx, _dummy)   = broadcast::channel::<Arc<Vec<u8>>>(4);
+            // Signaling task → transport task: viewer's UDP address when resolved.
+            let (peer_hint_tx, peer_hint_rx) = mpsc::unbounded_channel::<SocketAddr>();
 
             // Screen capture + VP8 encode thread.
             {
@@ -449,15 +485,27 @@ impl OverlayApp {
 
             // Transport task: send encoded frames to peer; receive annotations.
             {
-                let transport   = Arc::clone(&transport);
-                let annot_tx    = annot_tx;
+                let transport    = Arc::clone(&transport);
+                let annot_tx     = annot_tx;
                 let mut frame_rx = frame_tx.subscribe();
+                let mut peer_hint_rx = peer_hint_rx;
                 tokio::spawn(async move {
                     let mut peer:     Option<SocketAddr> = None;
                     let mut frame_id: u32                = 0;
                     let mut buf                          = vec![0u8; 65_536];
                     loop {
                         tokio::select! {
+                            // Signaling server resolved the viewer's address — punch proactively.
+                            hint = peer_hint_rx.recv() => {
+                                if let Some(addr) = hint {
+                                    tracing::info!("signaling: viewer at {addr}, punching");
+                                    peer = Some(addr);
+                                    for _ in 0..10 {
+                                        let _ = transport.send_punch(addr).await;
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                    }
+                                }
+                            }
                             res = transport.recv(&mut buf) => {
                                 if let Some((src, pkt)) = res {
                                     match pkt {
@@ -497,6 +545,32 @@ impl OverlayApp {
                 });
             }
 
+            // If registered with the rendezvous server, wait for a viewer to join.
+            // When they do, push their address to the transport task via peer_hint_tx.
+            if use_signaling {
+                let code   = room_code.clone();
+                tokio::spawn(async move {
+                    if let Some(server) = server_url() {
+                        match reqwest::Client::new()
+                            .get(format!("{server}/room/{code}/await"))
+                            .timeout(Duration::from_secs(65))
+                            .send().await
+                        {
+                            Ok(resp) if resp.status().is_success() => {
+                                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                    if let Some(addr_str) = v["peer"].as_str() {
+                                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                                            let _ = peer_hint_tx.send(addr);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => tracing::warn!("rendezvous /await failed or timed out"),
+                        }
+                    }
+                });
+            }
+
             let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws, capture_ok });
         });
         State::Discovering { rx }
@@ -512,13 +586,54 @@ impl OverlayApp {
     ///
     /// `sync_channel(1)` is intentional: if the decoder falls behind, newer frames
     /// overwrite the pending one so the viewer always shows the latest image.
-    fn begin_join(&mut self, host_addr: SocketAddr) -> tokio::sync::oneshot::Receiver<JoinReady> {
+    fn begin_join(&mut self, code: RoomCode) -> tokio::sync::oneshot::Receiver<JoinReady> {
         let (tx, rx) = tokio::sync::oneshot::channel::<JoinReady>();
         self.rt.spawn(async move {
             let transport = match Transport::bind().await {
                 Ok(t)  => Arc::new(t),
                 Err(e) => { tracing::error!("UDP bind: {e}"); return; }
             };
+
+            // Resolve the host address — either directly from the room code or via signaling.
+            let host_addr = match code {
+                RoomCode::Direct(addr) => addr,
+                RoomCode::Signaling(short_code) => {
+                    // STUN to learn our own public UDP address so the host can punch us back.
+                    let my_udp = transport.public_addr().await.unwrap_or_else(|| {
+                        let ip = crate::transport::discover_lan_ip()
+                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                        SocketAddr::new(ip, transport.socket.local_addr()
+                            .map(|a| a.port()).unwrap_or(0))
+                    });
+                    let body = serde_json::json!({ "udp": my_udp.to_string() });
+                    let server = match server_url() {
+                        Some(s) => s,
+                        None => { tracing::error!("BACKSEAT_SERVER not set"); return; }
+                    };
+                    match reqwest::Client::new()
+                        .post(format!("{server}/room/{short_code}/join"))
+                        .json(&body)
+                        .send().await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                match v["host"].as_str().and_then(|s| s.parse::<SocketAddr>().ok()) {
+                                    Some(addr) => {
+                                        tracing::info!("signaling: host is at {addr}");
+                                        addr
+                                    }
+                                    None => { tracing::error!("bad host addr from server"); return; }
+                                }
+                            } else { tracing::error!("bad json from server"); return; }
+                        }
+                        Ok(resp) => {
+                            tracing::error!("server returned {}", resp.status()); return;
+                        }
+                        Err(e) => { tracing::error!("signaling request failed: {e}"); return; }
+                    }
+                }
+            };
+
             tracing::info!("viewer bound on {:?}, punching {host_addr}",
                 transport.socket.local_addr());
 
@@ -689,6 +804,15 @@ fn apply_annot(msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mu
             cursors.lock().unwrap().clear_positions();
         }
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Returns the rendezvous server base URL from the `BACKSEAT_SERVER` environment
+/// variable (e.g. `https://backseat.fly.dev`).  Returns `None` if not set, which
+/// disables signaling and falls back to direct IP:port mode.
+fn server_url() -> Option<String> {
+    std::env::var("BACKSEAT_SERVER").ok()
 }
 
 // ── eframe integration ────────────────────────────────────────────────────────

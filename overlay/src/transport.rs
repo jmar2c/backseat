@@ -20,6 +20,14 @@ const PKT_ANNOT: u8 = 0x03;
 /// Maximum payload per UDP datagram — chosen to stay under typical path MTU.
 const CHUNK: usize = 1_200;
 
+/// What the viewer typed into the room-code box.
+pub enum RoomCode {
+    /// 6-letter code issued by the rendezvous server — requires signaling to resolve.
+    Signaling(String),
+    /// Direct `IP:port` — used as-is (port-forwarding / same-LAN mode).
+    Direct(SocketAddr),
+}
+
 /// Shared UDP socket used for all send/receive operations.
 pub struct Transport {
     pub socket: Arc<UdpSocket>,
@@ -52,9 +60,15 @@ impl Transport {
         addr.to_string()
     }
 
-    /// Parse a room code entered by the viewer back into a `SocketAddr`.
-    pub fn parse_room_code(s: &str) -> Option<SocketAddr> {
-        s.trim().parse().ok()
+    /// Parse whatever the viewer typed.
+    /// Accepts either a 6-letter signaling code (e.g. `"KXPQMZ"`) or a direct `IP:port`.
+    pub fn parse_room_code(s: &str) -> Option<RoomCode> {
+        let s = s.trim();
+        let upper = s.to_ascii_uppercase();
+        if upper.len() == 6 && upper.chars().all(|c| c.is_ascii_uppercase()) {
+            return Some(RoomCode::Signaling(upper));
+        }
+        s.parse::<SocketAddr>().ok().map(RoomCode::Direct)
     }
 
     /// Send a single-byte NAT punch packet.  Used by both sides to open the UDP hole.
