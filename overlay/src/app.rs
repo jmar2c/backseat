@@ -15,6 +15,53 @@ use crate::encoder::Vp8Encoder;
 use crate::transport::{Packet, Reassembler, RoomCode, Transport};
 use crate::types::{AnnotMsg, NormPoint, UserColor, UserId, UserInfo};
 
+// ── Tool state ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum PenType { Pen, Marker }
+
+/// The viewer's current annotation tool selection.
+struct ToolState {
+    pen_type:  PenType,
+    color_idx: usize,
+    size:      f32,
+    eraser:    bool,
+}
+
+/// Hex colours shown in the toolbar palette, paired with a tooltip label.
+const PALETTE: &[(&str, &str)] = &[
+    ("#e05c5c", "Red"),
+    ("#e0903c", "Orange"),
+    ("#e0c25c", "Yellow"),
+    ("#5ce07a", "Green"),
+    ("#5c9ee0", "Blue"),
+    ("#b05ce0", "Purple"),
+    ("#5ce0d4", "Teal"),
+    ("#ffffff", "White"),
+];
+
+impl Default for ToolState {
+    fn default() -> Self {
+        Self { pen_type: PenType::Pen, color_idx: 4, size: 3.0, eraser: false }
+    }
+}
+
+impl ToolState {
+    fn stroke_color(&self) -> &str { PALETTE[self.color_idx].0 }
+    fn stroke_width(&self) -> f32 {
+        match self.pen_type {
+            PenType::Pen    => self.size,
+            PenType::Marker => self.size * 4.0,
+        }
+    }
+    fn stroke_alpha(&self) -> u8 {
+        match self.pen_type {
+            PenType::Pen    => 255,
+            PenType::Marker => 110,
+        }
+    }
+}
+
 // ── Internal types ────────────────────────────────────────────────────────────
 
 /// Decoded video frame handed from the decode thread to the egui paint loop.
@@ -66,6 +113,8 @@ struct JoinCtx {
     viewer_id:     Uuid,
     active_stroke: Option<Uuid>,
     nat_warning:   Option<String>,
+    tool:          ToolState,
+    name:          String,
 }
 
 // ── State machine ─────────────────────────────────────────────────────────────
@@ -78,8 +127,8 @@ enum State {
     Discovering  { rx: tokio::sync::oneshot::Receiver<HostReady> },
     /// Host mode active: transparent overlay, tray icon showing room codes.
     Hosting      (HostCtx),
-    /// Viewer entering a room code (or waiting for the connection task to finish).
-    EnteringCode { input: String, error: Option<String>, connect_rx: Option<tokio::sync::oneshot::Receiver<JoinReady>> },
+    /// Viewer entering their name and a room code (or waiting for the connection task to finish).
+    EnteringCode { name: String, input: String, error: Option<String>, connect_rx: Option<tokio::sync::oneshot::Receiver<JoinReady>> },
     /// Viewer connected: displaying video stream with annotation canvas on top.
     Joining      (JoinCtx),
 }
@@ -122,7 +171,7 @@ impl OverlayApp {
                         });
                     });
                 if clicked_host { return self.begin_host(); }
-                if clicked_join { return State::EnteringCode { input: String::new(), error: None, connect_rx: None }; }
+                if clicked_join { return State::EnteringCode { name: String::new(), input: String::new(), error: None, connect_rx: None }; }
                 State::ChoosingMode
             }
 
@@ -203,12 +252,12 @@ impl OverlayApp {
                 State::Hosting(h)
             }
 
-            // ── Enter room code ───────────────────────────────────────────────
-            State::EnteringCode { mut input, error, mut connect_rx } => {
+            // ── Enter name + room code ────────────────────────────────────────
+            State::EnteringCode { mut name, mut input, error, mut connect_rx } => {
                 // Check if the connection task finished.
                 if let Some(ref mut rx) = connect_rx {
                     if let Ok(ready) = rx.try_recv() {
-                        return self.finish_join(ctx, ready);
+                        return self.finish_join(ctx, ready, name);
                     }
                 }
 
@@ -218,6 +267,9 @@ impl OverlayApp {
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                     .resizable(false).collapsible(false)
                     .show(ctx, |ui| {
+                        ui.label("Your name:");
+                        ui.text_edit_singleline(&mut name);
+                        ui.add_space(4.0);
                         ui.label("Room code:");
                         let resp = ui.text_edit_singleline(&mut input);
                         // Auto-connect on Enter key.
@@ -227,6 +279,7 @@ impl OverlayApp {
                         if let Some(ref e) = error {
                             ui.colored_label(egui::Color32::RED, e);
                         }
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             if connect_rx.is_some() {
                                 ui.label("Connecting…");
@@ -242,16 +295,17 @@ impl OverlayApp {
                     match Transport::parse_room_code(&input) {
                         Some(code) => {
                             let rx = self.begin_join(code);
-                            return State::EnteringCode { input, error: None, connect_rx: Some(rx) };
+                            return State::EnteringCode { name, input, error: None, connect_rx: Some(rx) };
                         }
                         None => return State::EnteringCode {
+                            name,
                             input,
                             error: Some("Invalid room code (expected 6-letter code or IP:port)".into()),
                             connect_rx: None,
                         },
                     }
                 }
-                State::EnteringCode { input, error, connect_rx }
+                State::EnteringCode { name, input, error, connect_rx }
             }
 
             // ── Joined — video + annotation canvas ────────────────────────────
@@ -280,6 +334,70 @@ impl OverlayApp {
                     }
                 }
 
+                // ── Toolbar ───────────────────────────────────────────────────
+                egui::Window::new("toolbar")
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+                    .resizable(false).collapsible(false).title_bar(false)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&j.name).strong());
+                            ui.separator();
+
+                            // Pen type
+                            if ui.selectable_label(j.tool.pen_type == PenType::Pen && !j.tool.eraser, "✏ Pen").clicked() {
+                                j.tool.pen_type = PenType::Pen;
+                                j.tool.eraser   = false;
+                            }
+                            if ui.selectable_label(j.tool.pen_type == PenType::Marker && !j.tool.eraser, "🖍 Marker").clicked() {
+                                j.tool.pen_type = PenType::Marker;
+                                j.tool.eraser   = false;
+                            }
+                            ui.separator();
+
+                            // Color palette
+                            for (i, &(hex, label)) in PALETTE.iter().enumerate() {
+                                let color    = crate::renderer::hex_to_color32(hex);
+                                let selected = j.tool.color_idx == i && !j.tool.eraser;
+                                let stroke   = if selected {
+                                    egui::Stroke::new(2.0, egui::Color32::WHITE)
+                                } else {
+                                    egui::Stroke::NONE
+                                };
+                                let btn = egui::Button::new("  ")
+                                    .fill(color)
+                                    .stroke(stroke)
+                                    .min_size(egui::vec2(22.0, 22.0));
+                                if ui.add(btn).on_hover_text(label).clicked() {
+                                    j.tool.color_idx = i;
+                                    j.tool.eraser    = false;
+                                }
+                            }
+                            ui.separator();
+
+                            // Brush size
+                            for &(label, sz) in &[("S", 2.0f32), ("M", 4.0), ("L", 8.0)] {
+                                if ui.selectable_label(j.tool.size == sz && !j.tool.eraser, label).clicked() {
+                                    j.tool.size   = sz;
+                                    j.tool.eraser = false;
+                                }
+                            }
+                            ui.separator();
+
+                            // Eraser
+                            if ui.selectable_label(j.tool.eraser, "⌫ Eraser").clicked() {
+                                j.tool.eraser = !j.tool.eraser;
+                            }
+
+                            // Clear all
+                            if ui.button("🗑 Clear").clicked() {
+                                j.draws.lock().unwrap().clear();
+                                let msg = AnnotMsg::ClearAll;
+                                let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                            }
+                        });
+                    });
+
+                // ── Canvas ────────────────────────────────────────────────────
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
@@ -293,36 +411,81 @@ impl OverlayApp {
                             y: ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0),
                         };
 
+                        // Cursor tracking (always active).
                         if let Some(pos) = response.hover_pos() {
                             let norm = to_norm(pos);
                             j.cursors.lock().unwrap().update(UserId(j.viewer_id), norm);
                             let msg = AnnotMsg::CursorMove { viewer_id: j.viewer_id, pos: norm };
                             let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                         }
-                        if response.drag_started() {
-                            let sid = Uuid::new_v4();
-                            j.active_stroke = Some(sid);
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                let norm = to_norm(pos);
-                                j.draws.lock().unwrap().add_point(UserId(j.viewer_id), sid, norm);
-                                let msg = AnnotMsg::StrokeBegin { viewer_id: j.viewer_id, stroke_id: sid, pos: norm };
-                                let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                            }
-                        }
-                        if let Some(sid) = j.active_stroke {
-                            if response.dragged() {
-                                if let Some(pos) = response.interact_pointer_pos() {
-                                    let norm = to_norm(pos);
-                                    j.draws.lock().unwrap().add_point(UserId(j.viewer_id), sid, norm);
-                                    let msg = AnnotMsg::StrokePoint { viewer_id: j.viewer_id, stroke_id: sid, pos: norm };
-                                    let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                                }
-                            }
-                            if response.drag_stopped() {
+
+                        if j.tool.eraser {
+                            // Finalize any in-progress stroke if tool was switched mid-drag.
+                            if let Some(sid) = j.active_stroke.take() {
                                 j.draws.lock().unwrap().end_stroke(sid);
                                 let msg = AnnotMsg::StrokeEnd { viewer_id: j.viewer_id, stroke_id: sid };
                                 let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                                j.active_stroke = None;
+                            }
+                            // Erase strokes near the cursor while dragging.
+                            if response.dragged() || response.drag_started() {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let norm = to_norm(pos);
+                                    const ERASE_R: f32 = 0.03;
+                                    let to_erase: Vec<Uuid> = {
+                                        let layer = j.draws.lock().unwrap();
+                                        layer.strokes.iter()
+                                            .filter_map(|(&id, s)| {
+                                                s.points.iter().any(|p| {
+                                                    let dx = p.x - norm.x;
+                                                    let dy = p.y - norm.y;
+                                                    dx * dx + dy * dy < ERASE_R * ERASE_R
+                                                }).then_some(id)
+                                            })
+                                            .collect()
+                                    };
+                                    for stroke_id in to_erase {
+                                        j.draws.lock().unwrap().remove_stroke(stroke_id);
+                                        let msg = AnnotMsg::EraseStroke { viewer_id: j.viewer_id, stroke_id };
+                                        let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                    }
+                                }
+                            }
+                            // Show eraser circle cursor.
+                            if let Some(pos) = response.hover_pos() {
+                                const ERASE_R: f32 = 0.03;
+                                let r = ERASE_R * rect.width().min(rect.height());
+                                painter.circle_stroke(pos, r, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                            }
+                        } else {
+                            // ── Draw mode ─────────────────────────────────────
+                            if response.drag_started() {
+                                let sid = Uuid::new_v4();
+                                j.active_stroke = Some(sid);
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let norm  = to_norm(pos);
+                                    let width = j.tool.stroke_width();
+                                    let color = j.tool.stroke_color().to_string();
+                                    let alpha = j.tool.stroke_alpha();
+                                    j.draws.lock().unwrap().begin_stroke(UserId(j.viewer_id), sid, norm, width, color.clone(), alpha);
+                                    let msg = AnnotMsg::StrokeBegin { viewer_id: j.viewer_id, stroke_id: sid, pos: norm, width, color, alpha };
+                                    let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                }
+                            }
+                            if let Some(sid) = j.active_stroke {
+                                if response.dragged() {
+                                    if let Some(pos) = response.interact_pointer_pos() {
+                                        let norm = to_norm(pos);
+                                        j.draws.lock().unwrap().add_point(UserId(j.viewer_id), sid, norm);
+                                        let msg = AnnotMsg::StrokePoint { viewer_id: j.viewer_id, stroke_id: sid, pos: norm };
+                                        let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                    }
+                                }
+                                if response.drag_stopped() {
+                                    j.draws.lock().unwrap().end_stroke(sid);
+                                    let msg = AnnotMsg::StrokeEnd { viewer_id: j.viewer_id, stroke_id: sid };
+                                    let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                    j.active_stroke = None;
+                                }
                             }
                         }
 
@@ -799,16 +962,26 @@ impl OverlayApp {
 
     /// Called once `JoinReady` arrives.  Restores a normal windowed viewport
     /// (the host runs fullscreen + passthrough; the viewer needs a regular interactive window).
-    fn finish_join(&self, ctx: &egui::Context, ready: JoinReady) -> State {
+    fn finish_join(&self, ctx: &egui::Context, ready: JoinReady, name: String) -> State {
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+
+        let display_name = if name.trim().is_empty() {
+            format!("viewer-{}", &ready.viewer_id.to_string()[..4])
+        } else {
+            name.trim().to_string()
+        };
+
+        // Tell the host our chosen name immediately.
+        let register = AnnotMsg::Register { viewer_id: ready.viewer_id, name: display_name.clone() };
+        let _ = ready.annot_out.send(serde_json::to_string(&register).unwrap());
 
         let cursors = Arc::new(Mutex::new(CursorState::default()));
         let draws   = Arc::new(Mutex::new(DrawLayer::default()));
         cursors.lock().unwrap().add_user(UserInfo {
             id:    UserId(ready.viewer_id),
-            name:  "you".into(),
+            name:  display_name.clone(),
             color: UserColor("#5c9ee0".into()),
         });
 
@@ -822,6 +995,8 @@ impl OverlayApp {
             viewer_id:     ready.viewer_id,
             active_stroke: None,
             nat_warning:   ready.nat_warning,
+            tool:          ToolState::default(),
+            name:          display_name,
         })
     }
 }
@@ -833,9 +1008,24 @@ impl OverlayApp {
 /// derived from the viewer UUID so the same viewer always gets the same colour.
 fn apply_annot(msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
     match msg {
+        AnnotMsg::Register { viewer_id, name } => {
+            let mut c = cursors.lock().unwrap();
+            if let Some(user) = c.users.get_mut(viewer_id) {
+                user.name = name.clone();
+            } else {
+                let palette = ["#e05c5c","#5c9ee0","#5ce07a","#e0c25c","#b05ce0","#5ce0d4"];
+                let color   = palette[(viewer_id.as_u128() % palette.len() as u128) as usize];
+                c.add_user(UserInfo {
+                    id:    UserId(*viewer_id),
+                    name:  name.clone(),
+                    color: UserColor(color.into()),
+                });
+            }
+        }
         AnnotMsg::CursorMove { viewer_id, pos } => {
             let mut c = cursors.lock().unwrap();
             if !c.users.contains_key(viewer_id) {
+                // Fallback: Register wasn't received first (UDP reorder).
                 let palette = ["#e05c5c","#5c9ee0","#5ce07a","#e0c25c","#b05ce0","#5ce0d4"];
                 let color   = palette[(viewer_id.as_u128() % palette.len() as u128) as usize];
                 c.add_user(UserInfo {
@@ -846,12 +1036,17 @@ fn apply_annot(msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mu
             }
             c.update(UserId(*viewer_id), *pos);
         }
-        AnnotMsg::StrokeBegin { viewer_id, stroke_id, pos } |
+        AnnotMsg::StrokeBegin { viewer_id, stroke_id, pos, width, color, alpha } => {
+            draws.lock().unwrap().begin_stroke(UserId(*viewer_id), *stroke_id, *pos, *width, color.clone(), *alpha);
+        }
         AnnotMsg::StrokePoint { viewer_id, stroke_id, pos } => {
             draws.lock().unwrap().add_point(UserId(*viewer_id), *stroke_id, *pos);
         }
         AnnotMsg::StrokeEnd { stroke_id, .. } => {
             draws.lock().unwrap().end_stroke(*stroke_id);
+        }
+        AnnotMsg::EraseStroke { stroke_id, .. } => {
+            draws.lock().unwrap().remove_stroke(*stroke_id);
         }
         AnnotMsg::ClearAll => {
             draws.lock().unwrap().clear();

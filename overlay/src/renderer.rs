@@ -14,7 +14,11 @@ fn to_screen(p: NormPoint, screen: Rect) -> Pos2 {
     )
 }
 
-fn hex_to_color32(hex: &str) -> Color32 {
+pub fn hex_to_color32(hex: &str) -> Color32 {
+    hex_to_color32_alpha(hex, 255)
+}
+
+pub fn hex_to_color32_alpha(hex: &str, alpha: u8) -> Color32 {
     let h = hex.trim_start_matches('#');
     if h.len() == 6 {
         if let (Ok(r), Ok(g), Ok(b)) = (
@@ -22,7 +26,7 @@ fn hex_to_color32(hex: &str) -> Color32 {
             u8::from_str_radix(&h[2..4], 16),
             u8::from_str_radix(&h[4..6], 16),
         ) {
-            return Color32::from_rgb(r, g, b);
+            return Color32::from_rgba_unmultiplied(r, g, b, alpha);
         }
     }
     Color32::WHITE
@@ -41,20 +45,13 @@ pub fn paint(
             if stroke.points.len() < 2 {
                 continue;
             }
-            // Look up color from cursor state (best-effort).
-            let color = {
-                let cs = cursors.lock().unwrap();
-                cs.users
-                    .get(&stroke.user_id)
-                    .map(|u| hex_to_color32(&u.color.0))
-                    .unwrap_or(Color32::from_rgb(255, 100, 100))
-            };
+            let color = hex_to_color32_alpha(&stroke.color, stroke.alpha);
             let pts: Vec<Pos2> = stroke
                 .points
                 .iter()
                 .map(|p| to_screen(*p, screen))
                 .collect();
-            painter.add(egui::Shape::line(pts, Stroke::new(3.0, color)));
+            painter.add(egui::Shape::line(pts, Stroke::new(stroke.width, color)));
         }
     }
 
