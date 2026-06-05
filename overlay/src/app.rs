@@ -502,21 +502,26 @@ impl OverlayApp {
                             // Signaling server resolved the viewer's address — punch proactively.
                             hint = peer_hint_rx.recv() => {
                                 if let Some(addr) = hint {
-                                    tracing::info!("signaling: viewer at {addr}, punching");
-                                    peer = Some(addr);
-                                    for _ in 0..10 {
-                                        let _ = transport.send_punch(addr).await;
-                                        tokio::time::sleep(Duration::from_millis(50)).await;
-                                    }
+                                    // addr is the viewer's STUN-reported address — it may be the
+                                    // wrong external port if the viewer is behind symmetric NAT.
+                                    // Punch it to help open the hole, but don't set `peer` yet;
+                                    // the punch handler below learns the real source port when the
+                                    // viewer's punch packet arrives.
+                                    tracing::info!("signaling: viewer STUN addr {addr}, punching (not setting peer)");
+                                    let t = Arc::clone(&transport);
+                                    tokio::spawn(async move {
+                                        for _ in 0..10 {
+                                            let _ = t.send_punch(addr).await;
+                                            tokio::time::sleep(Duration::from_millis(50)).await;
+                                        }
+                                    });
                                 }
                             }
                             res = transport.recv(&mut buf) => {
                                 if let Some((src, pkt)) = res {
                                     match pkt {
                                         Packet::Punch => {
-                                            if peer != Some(src) {
-                                                tracing::info!("viewer connected from {src}");
-                                            }
+                                            tracing::info!("punch rx from {src} (peer was {:?})", peer);
                                             peer = Some(src);
                                             let _ = transport.send_punch(src).await;
                                         }
@@ -550,50 +555,53 @@ impl OverlayApp {
             }
 
 
+            let initial_code = room_code.clone();
             let live_code = Arc::new(Mutex::new(room_code.clone()));
             let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws, capture_ok, live_code: Arc::clone(&live_code) });
 
-            // Keep re-registering with the signaling server after each timeout so the
-            // host always has a valid room code without requiring a restart.
+            // Poll /await for the current room code, then re-register after timeout.
+            // Start with the initial code (already registered above) to avoid double-registration.
             if use_signaling {
                 tokio::spawn(async move {
+                    let mut current_code = initial_code;
                     loop {
-                        // Re-register to get a fresh code (previous room expired).
-                        if let Some(server) = server_url() {
-                            let body = serde_json::json!({ "udp": wan_addr.to_string() });
-                            match reqwest::Client::new()
-                                .post(format!("{server}/host"))
-                                .json(&body)
-                                .send().await
-                            {
-                                Ok(resp) if resp.status().is_success() => {
-                                    if let Ok(v) = resp.json::<serde_json::Value>().await {
-                                        if let Some(code) = v["code"].as_str() {
-                                            tracing::info!("signaling new room code: {code}");
-                                            *live_code.lock().unwrap() = code.to_string();
-
-                                            // Wait for a viewer on this new code.
-                                            match reqwest::Client::new()
-                                                .get(format!("{server}/room/{code}/await"))
-                                                .timeout(Duration::from_secs(305))
-                                                .send().await
-                                            {
-                                                Ok(resp) if resp.status().is_success() => {
-                                                    if let Ok(v) = resp.json::<serde_json::Value>().await {
-                                                        if let Some(addr_str) = v["peer"].as_str() {
-                                                            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                                                                let _ = peer_hint_tx.send(addr);
-                                                                return; // connected, done
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                _ => {} // timeout or error — loop and re-register
-                                            }
+                        let server = match server_url() { Some(s) => s, None => return };
+                        tracing::info!("signaling: waiting for viewer on {current_code}");
+                        match reqwest::Client::new()
+                            .get(format!("{server}/room/{current_code}/await"))
+                            .timeout(Duration::from_secs(305))
+                            .send().await
+                        {
+                            Ok(resp) if resp.status().is_success() => {
+                                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                    if let Some(addr_str) = v["peer"].as_str() {
+                                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                                            tracing::info!("signaling: viewer at {addr}");
+                                            let _ = peer_hint_tx.send(addr);
+                                            return;
                                         }
                                     }
                                 }
-                                _ => { tokio::time::sleep(Duration::from_secs(5)).await; }
+                            }
+                            _ => {
+                                // timeout or error — re-register with a fresh code
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                match reqwest::Client::new()
+                                    .post(format!("{server}/host"))
+                                    .json(&serde_json::json!({ "udp": wan_addr.to_string() }))
+                                    .send().await
+                                {
+                                    Ok(resp) if resp.status().is_success() => {
+                                        if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                            if let Some(code) = v["code"].as_str() {
+                                                current_code = code.to_string();
+                                                *live_code.lock().unwrap() = current_code.clone();
+                                                tracing::info!("signaling: new code {current_code}");
+                                            }
+                                        }
+                                    }
+                                    _ => { tokio::time::sleep(Duration::from_secs(5)).await; }
+                                }
                             }
                         }
                     }
@@ -622,6 +630,7 @@ impl OverlayApp {
             };
 
             // Resolve the host address — either directly from the room code or via signaling.
+            let mut my_stun: Option<SocketAddr> = None;
             let host_addr = match code {
                 RoomCode::Direct(addr) => addr,
                 RoomCode::Signaling(short_code) => {
@@ -632,6 +641,7 @@ impl OverlayApp {
                         SocketAddr::new(ip, transport.socket.local_addr()
                             .map(|a| a.port()).unwrap_or(0))
                     });
+                    my_stun = Some(my_udp);
                     let body = serde_json::json!({ "udp": my_udp.to_string() });
                     let server = match server_url() {
                         Some(s) => s,
@@ -661,7 +671,7 @@ impl OverlayApp {
                 }
             };
 
-            tracing::info!("viewer bound on {:?}, punching {host_addr}",
+            tracing::info!("viewer local={:?} STUN={my_stun:?} host={host_addr}",
                 transport.socket.local_addr());
 
             // Punch through NAT — send several packets to open the hole.
@@ -724,27 +734,19 @@ impl OverlayApp {
                                 if let Some((src, pkt)) = res {
                                     match pkt {
                                         Packet::Punch => {
-                                            // Host sent a punch-back; learn its real address.
-                                            if actual_host != Some(src) {
-                                                tracing::info!("host confirmed at {src}");
-                                                actual_host = Some(src);
-                                            }
+                                            tracing::info!("punch-back rx from {src} (actual_host was {:?})", actual_host);
+                                            actual_host = Some(src);
                                         }
                                         Packet::VideoFrag { frame_id, frag_idx, frag_total, keyframe, data } => {
-                                            // Accept from the confirmed peer, or — before we have
-                                            // one — from any source sharing the room-code port
-                                            // (handles same-machine / no-hairpin-NAT cases).
-                                            let accepted = match actual_host {
+                                            let expected = match actual_host {
                                                 Some(h) => src == h,
-                                                None    => src == host_addr
-                                                            || src.port() == host_addr.port(),
+                                                None    => src == host_addr || src.port() == host_addr.port(),
                                             };
-                                            if !accepted {
-                                                tracing::warn!("dropping frag from {src} (expected {host_addr} or port {})", host_addr.port());
-                                                continue;
+                                            if !expected {
+                                                tracing::warn!("video from unexpected {src} (expected {host_addr} / {actual_host:?}) — accepting");
                                             }
-                                            if actual_host.is_none() {
-                                                tracing::info!("host video confirmed at {src}");
+                                            if actual_host != Some(src) {
+                                                tracing::info!("host video from {src}");
                                                 actual_host = Some(src);
                                             }
                                             tracing::debug!("rx frag frame={frame_id} {frag_idx}/{frag_total} kf={keyframe}");
