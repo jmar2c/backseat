@@ -494,27 +494,35 @@ impl OverlayApp {
                 let mut frame_rx = frame_tx.subscribe();
                 let mut peer_hint_rx = peer_hint_rx;
                 tokio::spawn(async move {
-                    let mut peer:     Option<SocketAddr> = None;
-                    let mut frame_id: u32                = 0;
-                    let mut buf                          = vec![0u8; 65_536];
+                    let mut peer:          Option<SocketAddr> = None;
+                    let mut frame_id:      u32                = 0;
+                    let mut buf                               = vec![0u8; 65_536];
+                    // Once the signaling task exits it drops peer_hint_tx, closing the channel.
+                    // A closed UnboundedReceiver::recv() returns None immediately on every poll,
+                    // which would starve the transport.recv() and frame_rx arms.  Guard the arm
+                    // with a flag so it is disabled once the channel is drained.
+                    let mut hint_done = false;
                     loop {
                         tokio::select! {
                             // Signaling server resolved the viewer's address — punch proactively.
-                            hint = peer_hint_rx.recv() => {
-                                if let Some(addr) = hint {
-                                    // addr is the viewer's STUN-reported address — it may be the
-                                    // wrong external port if the viewer is behind symmetric NAT.
-                                    // Punch it to help open the hole, but don't set `peer` yet;
-                                    // the punch handler below learns the real source port when the
-                                    // viewer's punch packet arrives.
-                                    tracing::info!("signaling: viewer STUN addr {addr}, punching (not setting peer)");
-                                    let t = Arc::clone(&transport);
-                                    tokio::spawn(async move {
-                                        for _ in 0..10 {
-                                            let _ = t.send_punch(addr).await;
-                                            tokio::time::sleep(Duration::from_millis(50)).await;
-                                        }
-                                    });
+                            hint = peer_hint_rx.recv(), if !hint_done => {
+                                match hint {
+                                    None => hint_done = true, // channel closed; disable this arm
+                                    Some(addr) => {
+                                        // addr is the viewer's STUN-reported address — it may be the
+                                        // wrong external port if the viewer is behind symmetric NAT.
+                                        // Punch it to help open the hole, but don't set `peer` yet;
+                                        // the punch handler below learns the real source port when the
+                                        // viewer's punch packet arrives.
+                                        tracing::info!("signaling: viewer STUN addr {addr}, punching (not setting peer)");
+                                        let t = Arc::clone(&transport);
+                                        tokio::spawn(async move {
+                                            for _ in 0..10 {
+                                                let _ = t.send_punch(addr).await;
+                                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                            }
+                                        });
+                                    }
                                 }
                             }
                             res = transport.recv(&mut buf) => {
