@@ -107,9 +107,13 @@ impl Transport {
     /// Returns `None` for packets that are malformed or have an unknown type.
     pub async fn recv(&self, buf: &mut Vec<u8>) -> Option<(SocketAddr, Packet)> {
         buf.resize(65_536, 0);
-        let (n, from) = self.socket.recv_from(buf).await.ok()?;
+        let (n, from) = match self.socket.recv_from(buf).await {
+            Ok(v) => v,
+            Err(e) => { tracing::warn!("recv_from error: {e}"); return None; }
+        };
         let data = &buf[..n];
         if data.is_empty() { return None; }
+        tracing::debug!("udp rx {n}B from {from} type=0x{:02x}", data[0]);
 
         let pkt = match data[0] {
             PKT_PUNCH => Packet::Punch,
