@@ -189,7 +189,27 @@ impl Reassembler {
 /// Send a minimal STUN Binding Request (RFC 5389) on `socket` and parse the
 /// XOR-MAPPED-ADDRESS from the response to learn the public IP:port.
 pub async fn gather_public_addr(socket: &UdpSocket) -> Option<SocketAddr> {
-    let stun_host = "stun.l.google.com:19302";
+    stun_query(socket, "stun.l.google.com:19302").await
+}
+
+/// Detect symmetric NAT (or a VPN acting as one) by querying two different STUN
+/// servers on the same socket.  If the reported external ports differ, the NAT
+/// assigns a new mapping per destination — hole-punching will not work reliably.
+/// Returns `Some(warning_message)` when a problem is detected, `None` if clean.
+pub async fn diagnose_nat(socket: &UdpSocket) -> Option<String> {
+    let a = stun_query(socket, "stun.l.google.com:19302").await?;
+    let b = stun_query(socket, "stun1.l.google.com:19302").await?;
+    if a.port() != b.port() {
+        return Some(format!(
+            "Symmetric NAT or VPN detected (STUN ports {}/{}). \
+             Hole-punching may fail — try disabling your VPN.",
+            a.port(), b.port()
+        ));
+    }
+    None
+}
+
+async fn stun_query(socket: &UdpSocket, stun_host: &str) -> Option<SocketAddr> {
     let stun_addr = tokio::net::lookup_host(stun_host).await.ok()?
         .find(|a| a.is_ipv4())?;
 

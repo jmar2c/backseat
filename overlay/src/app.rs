@@ -48,10 +48,11 @@ struct HostCtx {
 
 /// Payload sent from the async join setup task back to the egui thread once ready.
 struct JoinReady {
-    transport: Arc<Transport>,
-    rgba_rx:   mpsc::UnboundedReceiver<RgbaFrame>,
-    annot_out: mpsc::UnboundedSender<String>,
-    viewer_id: Uuid,
+    transport:   Arc<Transport>,
+    rgba_rx:     mpsc::UnboundedReceiver<RgbaFrame>,
+    annot_out:   mpsc::UnboundedSender<String>,
+    viewer_id:   Uuid,
+    nat_warning: Option<String>,
 }
 
 /// Live state held while in viewer (joined) mode.
@@ -64,6 +65,7 @@ struct JoinCtx {
     texture:       Option<egui::TextureHandle>,
     viewer_id:     Uuid,
     active_stroke: Option<Uuid>,
+    nat_warning:   Option<String>,
 }
 
 // ── State machine ─────────────────────────────────────────────────────────────
@@ -266,6 +268,15 @@ impl OverlayApp {
                             tracing::info!("first video texture {}x{}", frame.width, frame.height);
                             j.texture = Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
                         }
+                    }
+                }
+
+                if j.texture.is_none() {
+                    if let Some(ref w) = j.nat_warning {
+                        egui::Window::new("⚠ Connection warning")
+                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                            .resizable(false).collapsible(false)
+                            .show(ctx, |ui| { ui.label(w); });
                     }
                 }
 
@@ -638,7 +649,8 @@ impl OverlayApp {
             };
 
             // Resolve the host address — either directly from the room code or via signaling.
-            let mut my_stun: Option<SocketAddr> = None;
+            let mut my_stun:     Option<SocketAddr> = None;
+            let mut nat_warning: Option<String>     = None;
             let host_addr = match code {
                 RoomCode::Direct(addr) => addr,
                 RoomCode::Signaling(short_code) => {
@@ -650,6 +662,10 @@ impl OverlayApp {
                             .map(|a| a.port()).unwrap_or(0))
                     });
                     my_stun = Some(my_udp);
+                    nat_warning = crate::transport::diagnose_nat(&transport.socket).await;
+                    if let Some(ref w) = nat_warning {
+                        tracing::warn!("NAT diagnosis: {w}");
+                    }
                     let body = serde_json::json!({ "udp": my_udp.to_string() });
                     let server = match server_url() {
                         Some(s) => s,
@@ -776,7 +792,7 @@ impl OverlayApp {
                 });
             }
 
-            let _ = tx.send(JoinReady { transport, rgba_rx, annot_out: annot_out_tx, viewer_id });
+            let _ = tx.send(JoinReady { transport, rgba_rx, annot_out: annot_out_tx, viewer_id, nat_warning });
         });
         rx
     }
@@ -805,6 +821,7 @@ impl OverlayApp {
             texture:       None,
             viewer_id:     ready.viewer_id,
             active_stroke: None,
+            nat_warning:   ready.nat_warning,
         })
     }
 }
