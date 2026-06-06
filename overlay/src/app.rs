@@ -1003,25 +1003,28 @@ impl OverlayApp {
                                 if let Some((src, pkt)) = res {
                                     match pkt {
                                         Packet::Punch => {
-                                            tracing::info!("punch-back rx from {src} (actual_host was {:?})", actual_host);
-                                            actual_host = Some(src);
+                                            if actual_host.is_none() {
+                                                tracing::info!("punch-back from {src} — locking as actual_host");
+                                                actual_host = Some(src);
+                                            }
                                         }
                                         Packet::VideoFrag { frame_id, frag_idx, frag_total, keyframe, data } => {
-                                            let expected = match actual_host {
+                                            let accepted = match actual_host {
                                                 Some(h) => src == h,
                                                 None    => src == host_addr || src.port() == host_addr.port(),
                                             };
-                                            if !expected {
-                                                tracing::warn!("video from unexpected {src} (expected {host_addr} / {actual_host:?}) — accepting");
-                                            }
-                                            if actual_host != Some(src) {
-                                                tracing::info!("host video from {src}");
-                                                actual_host = Some(src);
-                                            }
-                                            tracing::debug!("rx frag frame={frame_id} {frag_idx}/{frag_total} kf={keyframe}");
-                                            if let Some((frame, _)) = reassembler.push(frame_id, frag_idx, frag_total, keyframe, data) {
-                                                tracing::debug!("reassembled frame {frame_id} ({} bytes)", frame.len());
-                                                let _ = frame_sync_tx.try_send(frame);
+                                            if !accepted {
+                                                tracing::warn!("video from unexpected {src} (expected {host_addr} / {actual_host:?}) — dropping");
+                                            } else {
+                                                if actual_host.is_none() {
+                                                    tracing::info!("host video from {src} — locking as actual_host");
+                                                    actual_host = Some(src);
+                                                }
+                                                tracing::debug!("rx frag frame={frame_id} {frag_idx}/{frag_total} kf={keyframe}");
+                                                if let Some((frame, _)) = reassembler.push(frame_id, frag_idx, frag_total, keyframe, data) {
+                                                    tracing::debug!("reassembled frame {frame_id} ({} bytes)", frame.len());
+                                                    let _ = frame_sync_tx.try_send(frame);
+                                                }
                                             }
                                         }
                                         _ => {}
