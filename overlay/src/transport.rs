@@ -264,6 +264,7 @@ fn parse_xor_mapped_address(buf: &[u8]) -> Option<SocketAddr> {
         let attr_type = u16::from_be_bytes([buf[i],     buf[i + 1]]);
         let attr_len  = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
         i += 4;
+        if i + attr_len > 20 + body_len { break; } // malformed: attribute overflows declared body
         if attr_type == 0x0020 && attr_len >= 8 && buf[i + 1] == 0x01 {
             let port = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) ^ (MAGIC >> 16) as u16;
             let ip   = u32::from_be_bytes([buf[i+4], buf[i+5], buf[i+6], buf[i+7]]) ^ MAGIC;
