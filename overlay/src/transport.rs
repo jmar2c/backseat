@@ -5,6 +5,7 @@
 //! [0x01]                                                  PKT_PUNCH
 //! [0x02][frame_id:u32be][idx:u16be][total:u16be][flags:u8][data…]  PKT_VIDEO
 //! [0x03][utf-8 json…]                                     PKT_ANNOT
+//! [0x04]                                                  PKT_DISCONNECT
 //! ```
 //! `flags` bit 0 = keyframe.  Frames are chunked to 1 200 bytes to stay well
 //! below typical path MTU (~1 500 bytes) and avoid IP fragmentation.
@@ -14,9 +15,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-const PKT_PUNCH: u8 = 0x01;
-const PKT_VIDEO: u8 = 0x02;
-const PKT_ANNOT: u8 = 0x03;
+const PKT_PUNCH:      u8 = 0x01;
+const PKT_VIDEO:      u8 = 0x02;
+const PKT_ANNOT:      u8 = 0x03;
+const PKT_DISCONNECT: u8 = 0x04;
 /// Maximum payload per UDP datagram — chosen to stay under typical path MTU.
 const CHUNK: usize = 1_200;
 
@@ -38,12 +40,22 @@ pub enum Packet {
     Punch,
     VideoFrag { frame_id: u32, frag_idx: u16, frag_total: u16, keyframe: bool, data: Vec<u8> },
     Annot(String),
+    Disconnect,
 }
 
 impl Transport {
-    /// Bind to the fixed backseat port on all interfaces.
+    /// Bind to the fixed backseat port on all interfaces (host mode).
     pub async fn bind() -> Result<Self, String> {
         UdpSocket::bind("0.0.0.0:47474")
+            .await
+            .map(|s| Self { socket: Arc::new(s) })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Bind to an OS-assigned ephemeral port (viewer mode).
+    /// Allows running host and viewer on the same machine without a port conflict.
+    pub async fn bind_ephemeral() -> Result<Self, String> {
+        UdpSocket::bind("0.0.0.0:0")
             .await
             .map(|s| Self { socket: Arc::new(s) })
             .map_err(|e| e.to_string())
@@ -130,6 +142,8 @@ impl Transport {
                 let s = std::str::from_utf8(&data[1..]).ok()?.to_string();
                 Packet::Annot(s)
             }
+
+            PKT_DISCONNECT => Packet::Disconnect,
 
             _ => return None,
         };

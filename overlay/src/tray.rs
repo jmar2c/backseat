@@ -9,6 +9,7 @@
 #[cfg(target_os = "linux")]
 pub struct HostTray {
     copy_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -16,14 +17,24 @@ impl HostTray {
     pub fn new(room_code: String) -> Self {
         use std::sync::{Arc, atomic::AtomicBool};
         let copy_flag = Arc::new(AtomicBool::new(false));
-        let tray = LinuxTray { room_code, copy_flag: Arc::clone(&copy_flag) };
+        let exit_flag = Arc::new(AtomicBool::new(false));
+        let tray = LinuxTray {
+            room_code,
+            copy_flag: Arc::clone(&copy_flag),
+            exit_flag: Arc::clone(&exit_flag),
+        };
         ksni::TrayService::new(tray).spawn();
-        Self { copy_flag }
+        Self { copy_flag, exit_flag }
     }
 
     pub fn pop_copy_request(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.copy_flag.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn pop_exit_request(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.exit_flag.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -31,6 +42,7 @@ impl HostTray {
 struct LinuxTray {
     room_code: String,
     copy_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -53,6 +65,14 @@ impl ksni::Tray for LinuxTray {
                 }),
                 ..Default::default()
             }.into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "Exit".into(),
+                activate: Box::new(|this: &mut Self| {
+                    this.exit_flag.store(true, Ordering::Relaxed);
+                }),
+                ..Default::default()
+            }.into(),
         ]
     }
 }
@@ -62,6 +82,7 @@ impl ksni::Tray for LinuxTray {
 #[cfg(windows)]
 pub struct HostTray {
     copy_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _tray: tray_icon::TrayIcon,
 }
 
@@ -72,13 +93,17 @@ impl HostTray {
         use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 
         let copy_flag = Arc::new(AtomicBool::new(false));
+        let exit_flag = Arc::new(AtomicBool::new(false));
 
         let menu = Menu::new();
         let label = MenuItem::new(&room_code, false, None);
         let sep   = PredefinedMenuItem::separator();
         let copy  = MenuItem::new("Copy room code", true, None);
         let copy_id = copy.id().clone();
-        menu.append_items(&[&label, &sep, &copy]).ok();
+        let sep2  = PredefinedMenuItem::separator();
+        let quit  = MenuItem::new("Exit", true, None);
+        let quit_id = quit.id().clone();
+        menu.append_items(&[&label, &sep, &copy, &sep2, &quit]).ok();
 
         let icon = make_win_icon();
         let _tray = tray_icon::TrayIconBuilder::new()
@@ -88,25 +113,33 @@ impl HostTray {
             .build()
             .expect("tray icon");
 
-        // Pump MenuEvents on a background thread; set copy_flag on match.
-        let flag = Arc::clone(&copy_flag);
+        // Pump MenuEvents on a background thread; set flags on match.
+        let copy_flag2 = Arc::clone(&copy_flag);
+        let exit_flag2 = Arc::clone(&exit_flag);
         std::thread::spawn(move || {
             let rx = tray_icon::menu::MenuEvent::receiver();
             loop {
                 if let Ok(ev) = rx.recv() {
                     if ev.id == copy_id {
-                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        copy_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else if ev.id == quit_id {
+                        exit_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
         });
 
-        Self { copy_flag, _tray }
+        Self { copy_flag, exit_flag, _tray }
     }
 
     pub fn pop_copy_request(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.copy_flag.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn pop_exit_request(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.exit_flag.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -139,4 +172,5 @@ pub struct HostTray;
 impl HostTray {
     pub fn new(_room_code: String) -> Self { Self }
     pub fn pop_copy_request(&self) -> bool { false }
+    pub fn pop_exit_request(&self) -> bool { false }
 }

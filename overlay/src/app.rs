@@ -68,30 +68,38 @@ impl ToolState {
 /// Decoded video frame handed from the decode thread to the egui paint loop.
 struct RgbaFrame { width: u32, height: u32, data: Vec<u8> }
 
+/// Per-peer state tracked in the host's transport task.
+struct PeerInfo {
+    last_seen: Instant,
+    viewer_id: Option<Uuid>,
+}
+
 /// Payload sent from the async host setup task back to the egui thread once ready.
 struct HostReady {
-    transport:   Arc<Transport>,
-    room_code:   String,  // WAN / STUN-discovered address
-    local_code:  String,  // LAN IP address (same port)
-    annot_rx:    mpsc::UnboundedReceiver<AnnotMsg>,
-    cursors:     Arc<Mutex<CursorState>>,
-    draws:       Arc<Mutex<DrawLayer>>,
-    capture_ok:  Arc<AtomicBool>,
+    transport:     Arc<Transport>,
+    room_code:     String,  // WAN / STUN-discovered address
+    local_code:    String,  // LAN IP address (same port)
+    annot_rx:      mpsc::UnboundedReceiver<AnnotMsg>,
+    disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
+    cursors:       Arc<Mutex<CursorState>>,
+    draws:         Arc<Mutex<DrawLayer>>,
+    capture_ok:    Arc<AtomicBool>,
     /// Updated in-place by the signaling task when the room code is refreshed.
-    live_code:   Arc<Mutex<String>>,
+    live_code:     Arc<Mutex<String>>,
 }
 
 /// Live state held while in host mode.
 struct HostCtx {
-    room_code:   String,
-    local_code:  String,
-    _transport:  Arc<Transport>, // keeps the socket alive for the duration of hosting
-    annot_rx:    mpsc::UnboundedReceiver<AnnotMsg>,
-    cursors:     Arc<Mutex<CursorState>>,
-    draws:       Arc<Mutex<DrawLayer>>,
-    tray:        crate::tray::HostTray,
-    capture_ok:  Arc<AtomicBool>,
-    live_code:   Arc<Mutex<String>>,
+    room_code:     String,
+    local_code:    String,
+    _transport:    Arc<Transport>, // keeps the socket alive for the duration of hosting
+    annot_rx:      mpsc::UnboundedReceiver<AnnotMsg>,
+    disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
+    cursors:       Arc<Mutex<CursorState>>,
+    draws:         Arc<Mutex<DrawLayer>>,
+    tray:          crate::tray::HostTray,
+    capture_ok:    Arc<AtomicBool>,
+    live_code:     Arc<Mutex<String>>,
 }
 
 /// Payload sent from the async join setup task back to the egui thread once ready.
@@ -100,6 +108,7 @@ struct JoinReady {
     rgba_rx:     mpsc::UnboundedReceiver<RgbaFrame>,
     annot_out:   mpsc::UnboundedSender<String>,
     viewer_id:   Uuid,
+    host_addr:   SocketAddr,
     nat_warning: Option<String>,
 }
 
@@ -112,6 +121,7 @@ struct JoinCtx {
     draws:         Arc<Mutex<DrawLayer>>,
     texture:       Option<egui::TextureHandle>,
     viewer_id:     Uuid,
+    host_addr:     SocketAddr,
     active_stroke: Option<Uuid>,
     nat_warning:   Option<String>,
     tool:          ToolState,
@@ -144,7 +154,10 @@ pub struct OverlayApp {
 }
 
 impl OverlayApp {
-    pub fn new(_cc: &eframe::CreationContext) -> Self {
+    pub fn new(cc: &eframe::CreationContext) -> Self {
+        #[cfg(target_os = "linux")]
+        x11_set_notification_type(cc);
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -184,18 +197,30 @@ impl OverlayApp {
                     .show(ctx, |ui| { ui.label("Discovering public address…"); });
                 match rx.try_recv() {
                     Ok(ready) => {
+                        // On Linux, _NET_WM_STATE_FULLSCREEN causes GNOME/Mutter to lower
+                        // the window when it loses focus. Exit fullscreen and manually cover
+                        // the screen so _NET_WM_STATE_ABOVE keeps us on top while
+                        // mouse clicks pass through.
+                        #[cfg(target_os = "linux")]
+                        {
+                            let sz = ctx.screen_rect().size();
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sz));
+                        }
                         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                         let tray = crate::tray::HostTray::new(ready.room_code.clone());
                         State::Hosting(HostCtx {
-                            room_code:   ready.room_code,
-                            local_code:  ready.local_code,
-                            _transport:  ready.transport,
-                            annot_rx:    ready.annot_rx,
-                            cursors:     ready.cursors,
-                            draws:       ready.draws,
+                            room_code:     ready.room_code,
+                            local_code:    ready.local_code,
+                            _transport:    ready.transport,
+                            annot_rx:      ready.annot_rx,
+                            disconnect_rx: ready.disconnect_rx,
+                            cursors:       ready.cursors,
+                            draws:         ready.draws,
                             tray,
-                            capture_ok:  ready.capture_ok,
-                            live_code:   ready.live_code,
+                            capture_ok:    ready.capture_ok,
+                            live_code:     ready.live_code,
                         })
                     }
                     Err(_) => State::Discovering { rx },
@@ -211,6 +236,15 @@ impl OverlayApp {
                 // Propagate clipboard copy requested via the tray icon menu.
                 if h.tray.pop_copy_request() {
                     ctx.output_mut(|o| o.copied_text = h.room_code.clone());
+                }
+
+                if h.tray.pop_exit_request() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
+                while let Ok(id) = h.disconnect_rx.try_recv() {
+                    h.cursors.lock().unwrap().remove_user(&UserId(id));
+                    h.draws.lock().unwrap().remove_user_strokes(id);
                 }
 
                 // Room-code HUD — always visible so the user knows what to enter on the viewer.
@@ -311,6 +345,14 @@ impl OverlayApp {
 
             // ── Joined — video + annotation canvas ────────────────────────────
             State::Joining(mut j) => {
+                // Notify the host when the viewer closes cleanly.
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                        let _ = sock.send_to(&[0x04u8], j.host_addr);
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
                 // Drain decoded frames, update the egui texture.
                 while let Ok(frame) = j.rgba_rx.try_recv() {
                     let img = egui::ColorImage::from_rgba_unmultiplied(
@@ -663,15 +705,17 @@ impl OverlayApp {
             }
 
             // Transport task: send encoded frames to peer; receive annotations.
+            let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<Uuid>();
             {
                 let transport    = Arc::clone(&transport);
                 let annot_tx     = annot_tx;
+                let disconnect_tx = disconnect_tx;
                 let mut frame_rx = frame_tx.subscribe();
                 let mut peer_hint_rx = peer_hint_rx;
                 tokio::spawn(async move {
-                    let mut peers:     HashMap<SocketAddr, Instant> = HashMap::new();
-                    let mut frame_id:  u32                          = 0;
-                    let mut buf                                     = vec![0u8; 65_536];
+                    let mut peers:    HashMap<SocketAddr, PeerInfo> = HashMap::new();
+                    let mut frame_id: u32                           = 0;
+                    let mut buf                                      = vec![0u8; 65_536];
                     // Once the signaling task exits it drops peer_hint_tx, closing the channel.
                     // A closed UnboundedReceiver::recv() returns None immediately on every poll,
                     // which would starve the transport.recv() and frame_rx arms.  Guard the arm
@@ -704,14 +748,29 @@ impl OverlayApp {
                                     match pkt {
                                         Packet::Punch => {
                                             let is_new = !peers.contains_key(&src);
-                                            peers.insert(src, Instant::now());
+                                            let info = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: None });
+                                            info.last_seen = Instant::now();
                                             if is_new { tracing::info!("new peer {src} (total: {})", peers.len()); }
                                             let _ = transport.send_punch(src).await;
                                         }
                                         Packet::Annot(json) => {
-                                            peers.entry(src).and_modify(|t| *t = Instant::now());
+                                            if let Some(info) = peers.get_mut(&src) {
+                                                info.last_seen = Instant::now();
+                                            }
                                             if let Ok(msg) = serde_json::from_str::<AnnotMsg>(&json) {
+                                                if let AnnotMsg::Register { viewer_id, .. } = &msg {
+                                                    let info = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: None });
+                                                    info.viewer_id = Some(*viewer_id);
+                                                }
                                                 let _ = annot_tx.send(msg);
+                                            }
+                                        }
+                                        Packet::Disconnect => {
+                                            if let Some(info) = peers.remove(&src) {
+                                                if let Some(id) = info.viewer_id {
+                                                    tracing::info!("viewer {id} disconnected cleanly");
+                                                    let _ = disconnect_tx.send(id);
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -724,7 +783,16 @@ impl OverlayApp {
                                         // Prune peers that have gone silent for > 30 s.
                                         let now = Instant::now();
                                         let before = peers.len();
-                                        peers.retain(|_, last| now.duration_since(*last) < Duration::from_secs(30));
+                                        peers.retain(|_, info| {
+                                            if now.duration_since(info.last_seen) >= Duration::from_secs(30) {
+                                                if let Some(id) = info.viewer_id {
+                                                    let _ = disconnect_tx.send(id);
+                                                }
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        });
                                         if peers.len() < before {
                                             tracing::info!("pruned {} stale peer(s), {} remaining", before - peers.len(), peers.len());
                                         }
@@ -750,7 +818,7 @@ impl OverlayApp {
 
             let initial_code = room_code.clone();
             let live_code = Arc::new(Mutex::new(room_code.clone()));
-            let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws, capture_ok, live_code: Arc::clone(&live_code) });
+            let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, disconnect_rx, cursors, draws, capture_ok, live_code: Arc::clone(&live_code) });
 
             // Long-poll /await to learn when viewers join, then loop for the next one.
             // The code stays constant for the session; we only re-register on 404
@@ -823,7 +891,7 @@ impl OverlayApp {
     fn begin_join(&mut self, code: RoomCode) -> tokio::sync::oneshot::Receiver<JoinReady> {
         let (tx, rx) = tokio::sync::oneshot::channel::<JoinReady>();
         self.rt.spawn(async move {
-            let transport = match Transport::bind().await {
+            let transport = match Transport::bind_ephemeral().await {
                 Ok(t)  => Arc::new(t),
                 Err(e) => { tracing::error!("UDP bind: {e}"); return; }
             };
@@ -972,7 +1040,7 @@ impl OverlayApp {
                 });
             }
 
-            let _ = tx.send(JoinReady { transport, rgba_rx, annot_out: annot_out_tx, viewer_id, nat_warning });
+            let _ = tx.send(JoinReady { transport, rgba_rx, annot_out: annot_out_tx, viewer_id, host_addr, nat_warning });
         });
         rx
     }
@@ -1010,6 +1078,7 @@ impl OverlayApp {
             draws,
             texture:       None,
             viewer_id:     ready.viewer_id,
+            host_addr:     ready.host_addr,
             active_stroke: None,
             nat_warning:   ready.nat_warning,
             tool:          ToolState::default(),
@@ -1096,4 +1165,62 @@ impl eframe::App for OverlayApp {
         self.state = self.step(ctx, state);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
+}
+
+/// Set `_NET_WM_WINDOW_TYPE_NOTIFICATION` on the overlay window.
+///
+/// GNOME/Mutter places notification-type windows above all normal windows,
+/// independent of focus changes — unlike `_NET_WM_STATE_ABOVE`, which Mutter
+/// overrides when another window is raised.  The type is set here, immediately
+/// after eframe creates the window, via a fresh RustConnection so we don't
+/// interfere with winit's own xcb state.
+#[cfg(target_os = "linux")]
+fn x11_set_notification_type(cc: &eframe::CreationContext) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::rust_connection::RustConnection;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let window_id: u32 = match cc.window_handle().ok().map(|h| h.as_raw()) {
+        Some(RawWindowHandle::Xcb(h))  => h.window.get(),
+        Some(RawWindowHandle::Xlib(h)) => h.window as u32,
+        _ => {
+            tracing::warn!("x11 overlay type: unrecognised window handle — skipping");
+            return;
+        }
+    };
+
+    let conn = match RustConnection::connect(None) {
+        Ok((c, _)) => c,
+        Err(e) => { tracing::warn!("x11 overlay type: X11 connect failed: {e}"); return; }
+    };
+
+    let wm_type = match conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE").ok()
+        .and_then(|c| c.reply().ok()).map(|r| r.atom)
+    {
+        Some(a) => a,
+        None => { tracing::warn!("x11 overlay type: intern _NET_WM_WINDOW_TYPE failed"); return; }
+    };
+
+    let notification = match conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE_NOTIFICATION").ok()
+        .and_then(|c| c.reply().ok()).map(|r| r.atom)
+    {
+        Some(a) => a,
+        None => { tracing::warn!("x11 overlay type: intern _NET_WM_WINDOW_TYPE_NOTIFICATION failed"); return; }
+    };
+
+    let cookie = match conn.change_property32(PropMode::REPLACE, window_id, wm_type,
+                                              AtomEnum::ATOM, &[notification])
+    {
+        Ok(c) => c,
+        Err(e) => { tracing::warn!("x11 overlay type: change_property failed: {e}"); return; }
+    };
+    if let Err(e) = cookie.check() {
+        tracing::warn!("x11 overlay type: change_property check failed: {e}");
+        return;
+    }
+
+    let _ = conn.flush();
+    tracing::info!("x11 overlay type: set _NET_WM_WINDOW_TYPE_NOTIFICATION on window {window_id}");
 }
