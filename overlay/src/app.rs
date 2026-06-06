@@ -30,6 +30,8 @@ struct ToolState {
 }
 
 /// Hex colours shown in the toolbar palette, paired with a tooltip label.
+const MAX_PEERS: usize = 50;
+
 const PALETTE: &[(&str, &str)] = &[
     ("#e05c5c", "Red"),
     ("#e0903c", "Orange"),
@@ -748,13 +750,17 @@ impl OverlayApp {
                                     match pkt {
                                         Packet::Punch => {
                                             let is_new = !peers.contains_key(&src);
-                                            let new_id = {
-                                                let entry = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: Uuid::new_v4() });
-                                                entry.last_seen = Instant::now();
-                                                entry.viewer_id
-                                            };
-                                            if is_new { tracing::info!("new peer {src} id={new_id} (total: {})", peers.len()); }
-                                            let _ = transport.send_punch(src).await;
+                                            if is_new && peers.len() >= MAX_PEERS {
+                                                tracing::warn!("peer limit reached ({MAX_PEERS}), dropping punch from {src}");
+                                            } else {
+                                                let new_id = {
+                                                    let entry = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: Uuid::new_v4() });
+                                                    entry.last_seen = Instant::now();
+                                                    entry.viewer_id
+                                                };
+                                                if is_new { tracing::info!("new peer {src} id={new_id} (total: {})", peers.len()); }
+                                                let _ = transport.send_punch(src).await;
+                                            }
                                         }
                                         Packet::Annot(json) => {
                                             if let Some(info) = peers.get_mut(&src) {
