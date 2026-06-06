@@ -4,17 +4,21 @@
 //!
 //! ```text
 //! POST /host              {"udp":"1.2.3.4:47474"}   → {"code":"KXPQMZ"}
-//! GET  /room/KXPQMZ/await                           → {"peer":"5.6.7.8:47474"}  (blocks until viewer joins, max 60 s)
+//! GET  /room/KXPQMZ/await                           → {"peer":"5.6.7.8:47474"}  (blocks until viewer joins, max 300 s)
 //! POST /room/KXPQMZ/join  {"udp":"5.6.7.8:47474"}   → {"host":"1.2.3.4:47474"}
 //! ```
 //!
-//! No video passes through here — only the two UDP addresses.
-//! Rooms expire automatically after 5 minutes if no viewer joins.
+//! Multiple viewers may join the same room.  Each `/join` enqueues the viewer's
+//! address; each `/await` poll dequeues one entry (or blocks until one arrives).
+//! The host loops on `/await` indefinitely with the same code; on 408 it retries,
+//! on 404 it re-registers (room truly expired).
+//!
+//! Rooms expire after 10 minutes of host inactivity (no `/await` calls).
 //!
 //! Configuration:
 //!   PORT   — TCP port to listen on (default 3000)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,17 +30,29 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::Notify;
 
 // ── Room state ────────────────────────────────────────────────────────────────
 
 struct Room {
-    host_udp: String,
-    /// Triggered by /join to wake up the blocked /await handler.
-    peer_tx:  Option<oneshot::Sender<String>>,
-    /// Held by the /await handler; taken out of the Mutex before awaiting.
-    peer_rx:  Option<oneshot::Receiver<String>>,
-    created:  Instant,
+    host_udp:   String,
+    /// Viewers that have joined but whose address hasn't been delivered yet.
+    pending:    Arc<Mutex<VecDeque<String>>>,
+    /// Wakes up a blocked `/await` handler whenever a viewer is enqueued.
+    notify:     Arc<Notify>,
+    /// Updated each time `/await` is called; used to detect abandoned rooms.
+    last_await: Arc<Mutex<Instant>>,
+}
+
+impl Room {
+    fn new(host_udp: String) -> Self {
+        Self {
+            host_udp,
+            pending:    Arc::new(Mutex::new(VecDeque::new())),
+            notify:     Arc::new(Notify::new()),
+            last_await: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -61,67 +77,70 @@ async fn handle_host(
     State(s): State<AppState>,
     Json(body): Json<HostBody>,
 ) -> Json<HostResp> {
-    let (tx, rx) = oneshot::channel::<String>();
     let code = {
         let mut rooms = s.rooms.lock().unwrap();
-        // Evict stale rooms on every registration (cheap, no background task needed).
-        rooms.retain(|_, r| r.created.elapsed() < Duration::from_secs(300));
+        // Evict rooms whose host has stopped polling (no /await in 10 minutes).
+        rooms.retain(|_, r| r.last_await.lock().unwrap().elapsed() < Duration::from_secs(600));
         let code = loop {
             let c = gen_code();
             if !rooms.contains_key(&c) { break c; }
         };
-        rooms.insert(code.clone(), Room {
-            host_udp: body.udp,
-            peer_tx: Some(tx),
-            peer_rx: Some(rx),
-            created: Instant::now(),
-        });
+        rooms.insert(code.clone(), Room::new(body.udp));
         code
     };
     tracing::info!("host registered room {code}");
     Json(HostResp { code })
 }
 
-/// Host long-polls here — blocks until a viewer joins (or 60 s timeout).
+/// Host long-polls here — blocks until a viewer joins (or 300 s timeout).
+/// Returns 408 when no viewer arrived; the host should retry with the same code.
+/// Returns 404 only if the room has been evicted (host was idle > 10 min).
+/// The host calls this in a loop to learn about successive viewers.
 async fn handle_await(
     State(s): State<AppState>,
     Path(code): Path<String>,
 ) -> Result<Json<AwaitResp>, StatusCode> {
-    // Take the receiver out of the room so we can await it without holding the lock.
-    let rx = {
-        let mut rooms = s.rooms.lock().unwrap();
-        let room = rooms.get_mut(&code).ok_or(StatusCode::NOT_FOUND)?;
-        room.peer_rx.take().ok_or(StatusCode::CONFLICT)? // CONFLICT = already waiting
+    // Clone the Arcs so we can release the rooms lock before awaiting.
+    let (pending, notify) = {
+        let rooms = s.rooms.lock().unwrap();
+        let room = rooms.get(&code).ok_or(StatusCode::NOT_FOUND)?;
+        // Refresh liveness so the room isn't evicted while the host is healthy.
+        *room.last_await.lock().unwrap() = Instant::now();
+        (Arc::clone(&room.pending), Arc::clone(&room.notify))
     };
 
-    match tokio::time::timeout(Duration::from_secs(300), rx).await {
-        Ok(Ok(peer_addr)) => {
-            s.rooms.lock().unwrap().remove(&code);
-            tracing::info!("room {code}: peer joined, both parties notified");
-            Ok(Json(AwaitResp { peer: peer_addr }))
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        if let Some(peer) = pending.lock().unwrap().pop_front() {
+            tracing::info!("room {code}: delivering peer {peer}");
+            return Ok(Json(AwaitResp { peer }));
         }
-        _ => {
-            s.rooms.lock().unwrap().remove(&code);
-            tracing::info!("room {code}: timed out waiting for viewer");
-            Err(StatusCode::REQUEST_TIMEOUT)
+        tokio::select! {
+            _ = notify.notified() => {}  // viewer joined; re-check the queue
+            _ = tokio::time::sleep_until(deadline) => {
+                // No viewer in this window — tell the host to retry (same code).
+                tracing::debug!("room {code}: await timeout, host should retry");
+                return Err(StatusCode::REQUEST_TIMEOUT);
+            }
         }
     }
 }
 
 /// Viewer submits the room code and its own public UDP address.
-/// The host's blocked /await call unblocks simultaneously.
+/// Enqueues the viewer's address and wakes up the host's blocked `/await`.
 async fn handle_join(
     State(s): State<AppState>,
     Path(code): Path<String>,
     Json(body): Json<JoinBody>,
 ) -> Result<Json<JoinResp>, StatusCode> {
-    let (host_udp, tx) = {
-        let mut rooms = s.rooms.lock().unwrap();
-        let room = rooms.get_mut(&code).ok_or(StatusCode::NOT_FOUND)?;
-        let tx = room.peer_tx.take().ok_or(StatusCode::CONFLICT)?;
-        (room.host_udp.clone(), tx)
+    let (host_udp, pending, notify) = {
+        let rooms = s.rooms.lock().unwrap();
+        let room = rooms.get(&code).ok_or(StatusCode::NOT_FOUND)?;
+        (room.host_udp.clone(), Arc::clone(&room.pending), Arc::clone(&room.notify))
     };
-    let _ = tx.send(body.udp); // wakes up the host's /await
+    tracing::info!("room {code}: viewer joined from {}", body.udp);
+    pending.lock().unwrap().push_back(body.udp);
+    notify.notify_one();
     Ok(Json(JoinResp { host: host_udp }))
 }
 

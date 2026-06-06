@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tokio::sync::{broadcast, mpsc};
@@ -668,9 +669,9 @@ impl OverlayApp {
                 let mut frame_rx = frame_tx.subscribe();
                 let mut peer_hint_rx = peer_hint_rx;
                 tokio::spawn(async move {
-                    let mut peer:          Option<SocketAddr> = None;
-                    let mut frame_id:      u32                = 0;
-                    let mut buf                               = vec![0u8; 65_536];
+                    let mut peers:     HashMap<SocketAddr, Instant> = HashMap::new();
+                    let mut frame_id:  u32                          = 0;
+                    let mut buf                                     = vec![0u8; 65_536];
                     // Once the signaling task exits it drops peer_hint_tx, closing the channel.
                     // A closed UnboundedReceiver::recv() returns None immediately on every poll,
                     // which would starve the transport.recv() and frame_rx arms.  Guard the arm
@@ -685,10 +686,9 @@ impl OverlayApp {
                                     Some(addr) => {
                                         // addr is the viewer's STUN-reported address — it may be the
                                         // wrong external port if the viewer is behind symmetric NAT.
-                                        // Punch it to help open the hole, but don't set `peer` yet;
-                                        // the punch handler below learns the real source port when the
-                                        // viewer's punch packet arrives.
-                                        tracing::info!("signaling: viewer STUN addr {addr}, punching (not setting peer)");
+                                        // Punch it to help open the hole; the punch handler below
+                                        // registers the real source port when the viewer's packet arrives.
+                                        tracing::info!("signaling: viewer STUN addr {addr}, punching");
                                         let t = Arc::clone(&transport);
                                         tokio::spawn(async move {
                                             for _ in 0..10 {
@@ -703,11 +703,13 @@ impl OverlayApp {
                                 if let Some((src, pkt)) = res {
                                     match pkt {
                                         Packet::Punch => {
-                                            tracing::info!("punch rx from {src} (peer was {:?})", peer);
-                                            peer = Some(src);
+                                            let is_new = !peers.contains_key(&src);
+                                            peers.insert(src, Instant::now());
+                                            if is_new { tracing::info!("new peer {src} (total: {})", peers.len()); }
                                             let _ = transport.send_punch(src).await;
                                         }
                                         Packet::Annot(json) => {
+                                            peers.entry(src).and_modify(|t| *t = Instant::now());
                                             if let Ok(msg) = serde_json::from_str::<AnnotMsg>(&json) {
                                                 let _ = annot_tx.send(msg);
                                             }
@@ -719,11 +721,20 @@ impl OverlayApp {
                             res = frame_rx.recv() => {
                                 match res {
                                     Ok(frame) => {
-                                        if let Some(addr) = peer {
+                                        // Prune peers that have gone silent for > 30 s.
+                                        let now = Instant::now();
+                                        let before = peers.len();
+                                        peers.retain(|_, last| now.duration_since(*last) < Duration::from_secs(30));
+                                        if peers.len() < before {
+                                            tracing::info!("pruned {} stale peer(s), {} remaining", before - peers.len(), peers.len());
+                                        }
+
+                                        if !peers.is_empty() {
                                             let kf = frame_id % 150 == 0;
-                                            if frame_id == 0 { tracing::info!("sending first video frame to {addr} ({} bytes)", frame.len()); }
-                                            if frame_id % 150 == 0 { tracing::debug!("host tx frame {frame_id} → {addr}"); }
-                                            let _ = transport.send_video(addr, frame_id, &frame, kf).await;
+                                            if frame_id % 150 == 0 { tracing::debug!("host tx frame {frame_id} → {} peer(s)", peers.len()); }
+                                            for &addr in peers.keys() {
+                                                let _ = transport.send_video(addr, frame_id, &frame, kf).await;
+                                            }
                                             frame_id = frame_id.wrapping_add(1);
                                         }
                                     }
@@ -741,14 +752,15 @@ impl OverlayApp {
             let live_code = Arc::new(Mutex::new(room_code.clone()));
             let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, cursors, draws, capture_ok, live_code: Arc::clone(&live_code) });
 
-            // Poll /await for the current room code, then re-register after timeout.
-            // Start with the initial code (already registered above) to avoid double-registration.
+            // Long-poll /await to learn when viewers join, then loop for the next one.
+            // The code stays constant for the session; we only re-register on 404
+            // (server evicted the room after 10 min of inactivity).
             if use_signaling {
                 tokio::spawn(async move {
                     let mut current_code = initial_code;
                     loop {
                         let server = match server_url() { Some(s) => s, None => return };
-                        tracing::info!("signaling: waiting for viewer on {current_code}");
+                        tracing::debug!("signaling: awaiting viewer on {current_code}");
                         match reqwest::Client::new()
                             .get(format!("{server}/room/{current_code}/await"))
                             .timeout(Duration::from_secs(305))
@@ -760,21 +772,22 @@ impl OverlayApp {
                                         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                                             tracing::info!("signaling: viewer at {addr}");
                                             let _ = peer_hint_tx.send(addr);
-                                            return;
                                         }
                                     }
                                 }
+                                // Loop immediately — more viewers may join on the same code.
                             }
-                            _ => {
-                                // timeout or error — re-register with a fresh code
+                            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                                // Room was evicted — re-register to get a new code.
+                                tracing::info!("signaling: room {current_code} expired, re-registering");
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 match reqwest::Client::new()
                                     .post(format!("{server}/host"))
                                     .json(&serde_json::json!({ "udp": wan_addr.to_string() }))
                                     .send().await
                                 {
-                                    Ok(resp) if resp.status().is_success() => {
-                                        if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                    Ok(r) if r.status().is_success() => {
+                                        if let Ok(v) = r.json::<serde_json::Value>().await {
                                             if let Some(code) = v["code"].as_str() {
                                                 current_code = code.to_string();
                                                 *live_code.lock().unwrap() = current_code.clone();
@@ -784,6 +797,10 @@ impl OverlayApp {
                                     }
                                     _ => { tokio::time::sleep(Duration::from_secs(5)).await; }
                                 }
+                            }
+                            Ok(_) | Err(_) => {
+                                // 408 (no viewer this window) or transient network error — retry same code.
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
                     }
