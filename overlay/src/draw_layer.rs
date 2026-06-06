@@ -65,7 +65,4 @@ impl DrawLayer {
         self.strokes.retain(|_, s| s.user_id != user_id);
     }
 
-    pub fn clear(&mut self) {
-        self.strokes.clear();
-    }
 }

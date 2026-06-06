@@ -79,7 +79,7 @@ struct HostReady {
     transport:     Arc<Transport>,
     room_code:     String,  // WAN / STUN-discovered address
     local_code:    String,  // LAN IP address (same port)
-    annot_rx:      mpsc::UnboundedReceiver<AnnotMsg>,
+    annot_rx:      mpsc::UnboundedReceiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
     cursors:       Arc<Mutex<CursorState>>,
     draws:         Arc<Mutex<DrawLayer>>,
@@ -93,7 +93,7 @@ struct HostCtx {
     room_code:     String,
     local_code:    String,
     _transport:    Arc<Transport>, // keeps the socket alive for the duration of hosting
-    annot_rx:      mpsc::UnboundedReceiver<AnnotMsg>,
+    annot_rx:      mpsc::UnboundedReceiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
     cursors:       Arc<Mutex<CursorState>>,
     draws:         Arc<Mutex<DrawLayer>>,
@@ -229,8 +229,8 @@ impl OverlayApp {
 
             // ── Hosting — transparent overlay with annotation rendering ────────
             State::Hosting(mut h) => {
-                while let Ok(msg) = h.annot_rx.try_recv() {
-                    apply_annot(&msg, &h.cursors, &h.draws);
+                while let Ok((src_id, msg)) = h.annot_rx.try_recv() {
+                    apply_annot(src_id, &msg, &h.cursors, &h.draws);
                 }
 
                 // Propagate clipboard copy requested via the tray icon menu.
@@ -433,7 +433,7 @@ impl OverlayApp {
 
                             // Clear all
                             if ui.button("🗑 Clear").clicked() {
-                                j.draws.lock().unwrap().clear();
+                                j.draws.lock().unwrap().remove_user_strokes(j.viewer_id);
                                 let msg = AnnotMsg::ClearAll;
                                 let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                             }
@@ -615,7 +615,7 @@ impl OverlayApp {
             let cursors     = Arc::new(Mutex::new(CursorState::default()));
             let draws       = Arc::new(Mutex::new(DrawLayer::default()));
             let capture_ok  = Arc::new(AtomicBool::new(true));
-            let (annot_tx, annot_rx) = mpsc::unbounded_channel::<AnnotMsg>();
+            let (annot_tx, annot_rx) = mpsc::unbounded_channel::<(Uuid, AnnotMsg)>();
             // _dummy holds the initial broadcast receiver so the channel isn't
             // immediately considered closed before the transport task subscribes.
             let (frame_tx, _dummy)   = broadcast::channel::<Arc<Vec<u8>>>(4);
@@ -762,7 +762,9 @@ impl OverlayApp {
                                                     let info = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: None });
                                                     info.viewer_id = Some(*viewer_id);
                                                 }
-                                                let _ = annot_tx.send(msg);
+                                                if let Some(viewer_id) = peers.get(&src).and_then(|p| p.viewer_id) {
+                                                    let _ = annot_tx.send((viewer_id, msg));
+                                                }
                                             }
                                         }
                                         Packet::Disconnect => {
@@ -1092,7 +1094,7 @@ impl OverlayApp {
 /// Apply one incoming annotation message to the shared host state.
 /// Auto-registers unknown viewers on first `CursorMove` using a deterministic colour
 /// derived from the viewer UUID so the same viewer always gets the same colour.
-fn apply_annot(msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
+fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
     match msg {
         AnnotMsg::Register { viewer_id, name } => {
             let mut c = cursors.lock().unwrap();
@@ -1135,8 +1137,7 @@ fn apply_annot(msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mu
             draws.lock().unwrap().remove_stroke(*stroke_id);
         }
         AnnotMsg::ClearAll => {
-            draws.lock().unwrap().clear();
-            cursors.lock().unwrap().clear_positions();
+            draws.lock().unwrap().remove_user_strokes(src_id);
         }
     }
 }

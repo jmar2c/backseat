@@ -27,11 +27,6 @@ impl CursorState {
         self.positions.insert(id.0, pos);
     }
 
-    /// Clear positions without removing user metadata (used on `ClearAll`).
-    pub fn clear_positions(&mut self) {
-        self.positions.clear();
-    }
-
     /// Iterate over `(position, color_hex, name)` for all viewers that have a known position.
     pub fn iter_visible(&self) -> impl Iterator<Item = (NormPoint, &str, &str)> {
         self.positions.iter().filter_map(|(id, pos)| {
