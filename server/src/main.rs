@@ -19,6 +19,7 @@
 //!   PORT   — TCP port to listen on (default 3000)
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+
+// Maximum number of pending viewer addresses queued per room.
+const MAX_PENDING: usize = 50;
 
 // ── Room state ────────────────────────────────────────────────────────────────
 
@@ -76,20 +81,23 @@ struct AppState {
 async fn handle_host(
     State(s): State<AppState>,
     Json(body): Json<HostBody>,
-) -> Json<HostResp> {
+) -> Result<Json<HostResp>, StatusCode> {
+    let host_addr: SocketAddr = body.udp.parse().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
     let code = {
-        let mut rooms = s.rooms.lock().unwrap();
+        let mut rooms = s.rooms.lock().unwrap_or_else(|p| p.into_inner());
         // Evict rooms whose host has stopped polling (no /await in 10 minutes).
-        rooms.retain(|_, r| r.last_await.lock().unwrap().elapsed() < Duration::from_secs(600));
+        rooms.retain(|_, r| {
+            r.last_await.lock().unwrap_or_else(|p| p.into_inner()).elapsed() < Duration::from_secs(600)
+        });
         let code = loop {
             let c = gen_code();
             if !rooms.contains_key(&c) { break c; }
         };
-        rooms.insert(code.clone(), Room::new(body.udp));
+        rooms.insert(code.clone(), Room::new(host_addr.to_string()));
         code
     };
-    tracing::info!("host registered room {code}");
-    Json(HostResp { code })
+    tracing::info!("host registered room {code} addr={host_addr}");
+    Ok(Json(HostResp { code }))
 }
 
 /// Host long-polls here — blocks until a viewer joins (or 300 s timeout).
@@ -102,16 +110,16 @@ async fn handle_await(
 ) -> Result<Json<AwaitResp>, StatusCode> {
     // Clone the Arcs so we can release the rooms lock before awaiting.
     let (pending, notify) = {
-        let rooms = s.rooms.lock().unwrap();
+        let rooms = s.rooms.lock().unwrap_or_else(|p| p.into_inner());
         let room = rooms.get(&code).ok_or(StatusCode::NOT_FOUND)?;
         // Refresh liveness so the room isn't evicted while the host is healthy.
-        *room.last_await.lock().unwrap() = Instant::now();
+        *room.last_await.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
         (Arc::clone(&room.pending), Arc::clone(&room.notify))
     };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
-        if let Some(peer) = pending.lock().unwrap().pop_front() {
+        if let Some(peer) = pending.lock().unwrap_or_else(|p| p.into_inner()).pop_front() {
             tracing::info!("room {code}: delivering peer {peer}");
             return Ok(Json(AwaitResp { peer }));
         }
@@ -133,13 +141,20 @@ async fn handle_join(
     Path(code): Path<String>,
     Json(body): Json<JoinBody>,
 ) -> Result<Json<JoinResp>, StatusCode> {
+    let viewer_addr: SocketAddr = body.udp.parse().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
     let (host_udp, pending, notify) = {
-        let rooms = s.rooms.lock().unwrap();
+        let rooms = s.rooms.lock().unwrap_or_else(|p| p.into_inner());
         let room = rooms.get(&code).ok_or(StatusCode::NOT_FOUND)?;
         (room.host_udp.clone(), Arc::clone(&room.pending), Arc::clone(&room.notify))
     };
-    tracing::info!("room {code}: viewer joined from {}", body.udp);
-    pending.lock().unwrap().push_back(body.udp);
+    {
+        let mut q = pending.lock().unwrap_or_else(|p| p.into_inner());
+        if q.len() >= MAX_PENDING {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        q.push_back(viewer_addr.to_string());
+    }
+    tracing::info!("room {code}: viewer joined from {viewer_addr}");
     notify.notify_one();
     Ok(Json(JoinResp { host: host_udp }))
 }
@@ -165,16 +180,29 @@ async fn main() {
         rooms: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    // 10 req/s sustained, burst of 30 — transparent to legitimate clients,
+    // blocks flood attacks. SmartIpKeyExtractor reads X-Forwarded-For first
+    // (set by Fly's proxy) then falls back to ConnectInfo.
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(10)
+            .burst_size(30)
+            .finish()
+            .unwrap(),
+    );
+
     let app = Router::new()
         .route("/host",               post(handle_host))
         .route("/room/:code/await",   get(handle_await))
         .route("/room/:code/join",    post(handle_join))
         .route("/health",             get(|| async { "ok" }))
-        .with_state(state);
+        .with_state(state)
+        .layer(GovernorLayer { config: governor_conf });
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".into());
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("backseat-server listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // into_make_service_with_connect_info exposes the peer IP to GovernorLayer.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }

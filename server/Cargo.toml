@@ -11,3 +11,4 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3" }
 axum = "0.7"
 rand = "0.8"
+tower_governor = "0.4"
