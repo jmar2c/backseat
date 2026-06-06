@@ -154,6 +154,10 @@ impl Transport {
 
 // ── Fragment reassembler ──────────────────────────────────────────────────────
 
+/// Maximum fragments accepted per frame. 1000 × 1190 B ≈ 1.2 MB — well above any
+/// real VP8 frame; rejects memory-exhaustion attacks from malicious peers.
+const MAX_FRAGS_PER_FRAME: u16 = 1000;
+
 /// Collects fragments for multiple in-flight frames and emits complete frames.
 pub struct Reassembler {
     frames: HashMap<u32, PendingFrame>,
@@ -179,6 +183,9 @@ impl Reassembler {
         &mut self,
         frame_id: u32, frag_idx: u16, frag_total: u16, keyframe: bool, data: Vec<u8>,
     ) -> Option<(Vec<u8>, bool)> {
+        if frag_total == 0 || frag_total > MAX_FRAGS_PER_FRAME || frag_idx >= frag_total {
+            return None;
+        }
         self.frames.retain(|id, _| frame_id.wrapping_sub(*id) <= 60);
 
         let entry = self.frames.entry(frame_id).or_insert(PendingFrame {
