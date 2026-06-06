@@ -71,7 +71,7 @@ struct RgbaFrame { width: u32, height: u32, data: Vec<u8> }
 /// Per-peer state tracked in the host's transport task.
 struct PeerInfo {
     last_seen: Instant,
-    viewer_id: Option<Uuid>,
+    viewer_id: Uuid, // assigned by host at first contact; never taken from client-supplied JSON
 }
 
 /// Payload sent from the async host setup task back to the egui thread once ready.
@@ -748,9 +748,12 @@ impl OverlayApp {
                                     match pkt {
                                         Packet::Punch => {
                                             let is_new = !peers.contains_key(&src);
-                                            let info = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: None });
-                                            info.last_seen = Instant::now();
-                                            if is_new { tracing::info!("new peer {src} (total: {})", peers.len()); }
+                                            let new_id = {
+                                                let entry = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: Uuid::new_v4() });
+                                                entry.last_seen = Instant::now();
+                                                entry.viewer_id
+                                            };
+                                            if is_new { tracing::info!("new peer {src} id={new_id} (total: {})", peers.len()); }
                                             let _ = transport.send_punch(src).await;
                                         }
                                         Packet::Annot(json) => {
@@ -758,21 +761,15 @@ impl OverlayApp {
                                                 info.last_seen = Instant::now();
                                             }
                                             if let Ok(msg) = serde_json::from_str::<AnnotMsg>(&json) {
-                                                if let AnnotMsg::Register { viewer_id, .. } = &msg {
-                                                    let info = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: None });
-                                                    info.viewer_id = Some(*viewer_id);
-                                                }
-                                                if let Some(viewer_id) = peers.get(&src).and_then(|p| p.viewer_id) {
-                                                    let _ = annot_tx.send((viewer_id, msg));
+                                                if let Some(peer) = peers.get(&src) {
+                                                    let _ = annot_tx.send((peer.viewer_id, msg));
                                                 }
                                             }
                                         }
                                         Packet::Disconnect => {
                                             if let Some(info) = peers.remove(&src) {
-                                                if let Some(id) = info.viewer_id {
-                                                    tracing::info!("viewer {id} disconnected cleanly");
-                                                    let _ = disconnect_tx.send(id);
-                                                }
+                                                tracing::info!("viewer {} disconnected cleanly", info.viewer_id);
+                                                let _ = disconnect_tx.send(info.viewer_id);
                                             }
                                         }
                                         _ => {}
@@ -787,9 +784,7 @@ impl OverlayApp {
                                         let before = peers.len();
                                         peers.retain(|_, info| {
                                             if now.duration_since(info.last_seen) >= Duration::from_secs(30) {
-                                                if let Some(id) = info.viewer_id {
-                                                    let _ = disconnect_tx.send(id);
-                                                }
+                                                let _ = disconnect_tx.send(info.viewer_id);
                                                 false
                                             } else {
                                                 true
@@ -1096,39 +1091,39 @@ impl OverlayApp {
 /// derived from the viewer UUID so the same viewer always gets the same colour.
 fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
     match msg {
-        AnnotMsg::Register { viewer_id, name } => {
+        AnnotMsg::Register { name, .. } => {
             let mut c = cursors.lock().unwrap();
-            if let Some(user) = c.users.get_mut(viewer_id) {
+            if let Some(user) = c.users.get_mut(&src_id) {
                 user.name = name.clone();
             } else {
                 let palette = ["#e05c5c","#5c9ee0","#5ce07a","#e0c25c","#b05ce0","#5ce0d4"];
-                let color   = palette[(viewer_id.as_u128() % palette.len() as u128) as usize];
+                let color   = palette[(src_id.as_u128() % palette.len() as u128) as usize];
                 c.add_user(UserInfo {
-                    id:    UserId(*viewer_id),
+                    id:    UserId(src_id),
                     name:  name.clone(),
                     color: UserColor(color.into()),
                 });
             }
         }
-        AnnotMsg::CursorMove { viewer_id, pos } => {
+        AnnotMsg::CursorMove { pos, .. } => {
             let mut c = cursors.lock().unwrap();
-            if !c.users.contains_key(viewer_id) {
+            if !c.users.contains_key(&src_id) {
                 // Fallback: Register wasn't received first (UDP reorder).
                 let palette = ["#e05c5c","#5c9ee0","#5ce07a","#e0c25c","#b05ce0","#5ce0d4"];
-                let color   = palette[(viewer_id.as_u128() % palette.len() as u128) as usize];
+                let color   = palette[(src_id.as_u128() % palette.len() as u128) as usize];
                 c.add_user(UserInfo {
-                    id:    UserId(*viewer_id),
-                    name:  format!("viewer-{}", &viewer_id.to_string()[..4]),
+                    id:    UserId(src_id),
+                    name:  format!("viewer-{}", &src_id.to_string()[..4]),
                     color: UserColor(color.into()),
                 });
             }
-            c.update(UserId(*viewer_id), *pos);
+            c.update(UserId(src_id), *pos);
         }
-        AnnotMsg::StrokeBegin { viewer_id, stroke_id, pos, width, color, alpha } => {
-            draws.lock().unwrap().begin_stroke(UserId(*viewer_id), *stroke_id, *pos, *width, color.clone(), *alpha);
+        AnnotMsg::StrokeBegin { stroke_id, pos, width, color, alpha, .. } => {
+            draws.lock().unwrap().begin_stroke(UserId(src_id), *stroke_id, *pos, *width, color.clone(), *alpha);
         }
-        AnnotMsg::StrokePoint { viewer_id, stroke_id, pos } => {
-            draws.lock().unwrap().add_point(UserId(*viewer_id), *stroke_id, *pos);
+        AnnotMsg::StrokePoint { stroke_id, pos, .. } => {
+            draws.lock().unwrap().add_point(UserId(src_id), *stroke_id, *pos);
         }
         AnnotMsg::StrokeEnd { stroke_id, .. } => {
             draws.lock().unwrap().end_stroke(*stroke_id);
