@@ -90,8 +90,8 @@ impl AudioCapture {
         source: AudioSource,
     ) -> Result<(Self, mpsc::UnboundedReceiver<(u32, Vec<u8>)>), String> {
         let app_type = match &source {
-            AudioSource::Desktop => opus::Application::Audio,
-            _                    => opus::Application::Voip,
+            AudioSource::Desktop => crate::opus::Application::Audio,
+            _                    => crate::opus::Application::Voip,
         };
         let device = open_input_device(source)?;
 
@@ -103,7 +103,7 @@ impl AudioCapture {
 
         let (tx, rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
 
-        let mut enc = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, app_type)
+        let mut enc = crate::opus::OpusEncoder::new(SAMPLE_RATE, 1, app_type)
             .map_err(|e| format!("opus encoder: {e}"))?;
         let mut sample_buf: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 2);
         let mut rtp_ts: u32          = 0;
@@ -203,7 +203,7 @@ impl AudioPlayer {
 
         // Opus decode thread: pulls packets from the tokio channel, decodes, fills PCM buffer.
         let dec_thread = std::thread::spawn(move || {
-            let mut dec = match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) {
+            let mut dec = match crate::opus::OpusDecoder::new(SAMPLE_RATE, 1) {
                 Ok(d)  => d,
                 Err(e) => { tracing::error!("opus decoder init: {e}"); return; }
             };
@@ -211,7 +211,7 @@ impl AudioPlayer {
             loop {
                 match rx.blocking_recv() {
                     Some((_ts, data)) => {
-                        match dec.decode_float(&data, &mut pcm, false) {
+                        match dec.decode_float(&data, &mut pcm) {
                             Ok(n) => {
                                 let mut b = pcm_dec.lock().unwrap();
                                 // Cap at 250 ms to prevent runaway growth if decoding outruns playback.

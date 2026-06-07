@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod opus;
 mod types;
 mod capture;
 mod cursor;
