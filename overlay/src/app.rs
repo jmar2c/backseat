@@ -8,6 +8,14 @@ use eframe::egui;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+use crate::audio::{AudioCapture, AudioPlayer, AudioSource};
+
+// cpal::Stream is !Send, so AudioCapture and AudioPlayer cannot be moved into
+// tokio tasks or Send types.  Since audio runs for the lifetime of the process
+// (no "stop hosting" transition exists), Box::leak is the right approach.
+fn keepalive<T: 'static>(v: T) {
+    Box::leak(Box::new(v));
+}
 use crate::capture::ScreenCapture;
 use crate::cursor::CursorState;
 use crate::decoder::Vp8Decoder;
@@ -21,7 +29,6 @@ use crate::types::{AnnotMsg, NormPoint, UserColor, UserId, UserInfo};
 #[derive(Clone, Copy, PartialEq)]
 enum PenType { Pen, Marker }
 
-/// The viewer's current annotation tool selection.
 struct ToolState {
     pen_type:  PenType,
     color_idx: usize,
@@ -29,7 +36,6 @@ struct ToolState {
     eraser:    bool,
 }
 
-/// Hex colours shown in the toolbar palette, paired with a tooltip label.
 const MAX_PEERS: usize = 50;
 
 const PALETTE: &[(&str, &str)] = &[
@@ -67,34 +73,36 @@ impl ToolState {
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
-/// Decoded video frame handed from the decode thread to the egui paint loop.
 struct RgbaFrame { width: u32, height: u32, data: Vec<u8> }
 
-/// Per-peer state tracked in the host's transport task.
-struct PeerInfo {
-    last_seen: Instant,
-    viewer_id: Uuid, // assigned by host at first contact; never taken from client-supplied JSON
+/// Encoded VP8 frame plus the 90 kHz RTP timestamp used to encode it.
+struct EncodedFrame {
+    data:     Vec<u8>,
+    pts:      u32,
+    keyframe: bool,
 }
 
-/// Payload sent from the async host setup task back to the egui thread once ready.
+struct PeerInfo {
+    last_seen: Instant,
+    viewer_id: Uuid,
+}
+
 struct HostReady {
     transport:     Arc<Transport>,
-    room_code:     String,  // WAN / STUN-discovered address
-    local_code:    String,  // LAN IP address (same port)
+    room_code:     String,
+    local_code:    String,
     annot_rx:      mpsc::UnboundedReceiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
     cursors:       Arc<Mutex<CursorState>>,
     draws:         Arc<Mutex<DrawLayer>>,
     capture_ok:    Arc<AtomicBool>,
-    /// Updated in-place by the signaling task when the room code is refreshed.
     live_code:     Arc<Mutex<String>>,
 }
 
-/// Live state held while in host mode.
 struct HostCtx {
     room_code:     String,
     local_code:    String,
-    _transport:    Arc<Transport>, // keeps the socket alive for the duration of hosting
+    _transport:    Arc<Transport>,
     annot_rx:      mpsc::UnboundedReceiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
     cursors:       Arc<Mutex<CursorState>>,
@@ -104,7 +112,6 @@ struct HostCtx {
     live_code:     Arc<Mutex<String>>,
 }
 
-/// Payload sent from the async join setup task back to the egui thread once ready.
 struct JoinReady {
     transport:   Arc<Transport>,
     rgba_rx:     mpsc::UnboundedReceiver<RgbaFrame>,
@@ -114,9 +121,8 @@ struct JoinReady {
     nat_warning: Option<String>,
 }
 
-/// Live state held while in viewer (joined) mode.
 struct JoinCtx {
-    _transport:    Arc<Transport>, // keeps the socket alive for the duration of the session
+    _transport:    Arc<Transport>,
     rgba_rx:       mpsc::UnboundedReceiver<RgbaFrame>,
     annot_out:     mpsc::UnboundedSender<String>,
     cursors:       Arc<Mutex<CursorState>>,
@@ -132,24 +138,20 @@ struct JoinCtx {
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
-/// The top-level application state.  Transitions happen inside [`OverlayApp::step`].
 enum State {
-    /// Initial screen — user picks host or join.
     ChoosingMode,
-    /// Host mode starting up: STUN query in progress, waiting for [`HostReady`].
+    ConfiguringHost {
+        audio_source: AudioSource,
+        has_monitor:  bool,
+    },
     Discovering  { rx: tokio::sync::oneshot::Receiver<HostReady> },
-    /// Host mode active: transparent overlay, tray icon showing room codes.
     Hosting      (HostCtx),
-    /// Viewer entering their name and a room code (or waiting for the connection task to finish).
     EnteringCode { name: String, input: String, error: Option<String>, connect_rx: Option<tokio::sync::oneshot::Receiver<JoinReady>> },
-    /// Viewer connected: displaying video stream with annotation canvas on top.
     Joining      (JoinCtx),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
-/// Root eframe application.  Owns the Tokio runtime and drives the state machine
-/// each egui frame via [`eframe::App::update`].
 pub struct OverlayApp {
     state: State,
     rt:    tokio::runtime::Runtime,
@@ -167,8 +169,6 @@ impl OverlayApp {
         Self { state: State::ChoosingMode, rt }
     }
 
-    /// Drive one frame of the state machine.  Takes ownership of `state` so each
-    /// arm can consume it and return the next state without fighting the borrow checker.
     fn step(&mut self, ctx: &egui::Context, state: State) -> State {
         match state {
 
@@ -186,9 +186,56 @@ impl OverlayApp {
                             clicked_join = ui.button("  Join  ").clicked();
                         });
                     });
-                if clicked_host { return self.begin_host(); }
-                if clicked_join { return State::EnteringCode { name: String::new(), input: String::new(), error: None, connect_rx: None }; }
+                if clicked_host {
+                    let (has_monitor, _) = crate::audio::probe_devices();
+                    return State::ConfiguringHost {
+                        audio_source: AudioSource::None,
+                        has_monitor,
+                    };
+                }
+                if clicked_join {
+                    return State::EnteringCode {
+                        name: String::new(), input: String::new(),
+                        error: None, connect_rx: None,
+                    };
+                }
                 State::ChoosingMode
+            }
+
+            // ── Host settings ─────────────────────────────────────────────────
+            State::ConfiguringHost { mut audio_source, has_monitor } => {
+                let mut go_back  = false;
+                let mut go_start = false;
+
+                egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |_| {});
+                egui::Window::new("backseat — host settings")
+                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                    .resizable(false).collapsible(false)
+                    .show(ctx, |ui| {
+                        ui.label(egui::RichText::new("Audio source").strong());
+                        ui.add_space(4.0);
+                        ui.radio_value(&mut audio_source, AudioSource::None,       "None");
+                        ui.radio_value(&mut audio_source, AudioSource::Microphone, "Microphone");
+                        ui.add_enabled_ui(has_monitor, |ui| {
+                            ui.radio_value(&mut audio_source, AudioSource::Desktop, "Desktop audio");
+                        });
+                        if !has_monitor {
+                            ui.label(
+                                egui::RichText::new("(desktop audio not available — no monitor source found)")
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            go_back  = ui.button("Back").clicked();
+                            go_start = ui.button("Start Hosting").clicked();
+                        });
+                    });
+
+                if go_back  { return State::ChoosingMode; }
+                if go_start { return self.begin_host(audio_source); }
+                State::ConfiguringHost { audio_source, has_monitor }
             }
 
             // ── Waiting for STUN ──────────────────────────────────────────────
@@ -199,10 +246,6 @@ impl OverlayApp {
                     .show(ctx, |ui| { ui.label("Discovering public address…"); });
                 match rx.try_recv() {
                     Ok(ready) => {
-                        // On Linux, _NET_WM_STATE_FULLSCREEN causes GNOME/Mutter to lower
-                        // the window when it loses focus. Exit fullscreen and manually cover
-                        // the screen so _NET_WM_STATE_ABOVE keeps us on top while
-                        // mouse clicks pass through.
                         #[cfg(target_os = "linux")]
                         {
                             let sz = ctx.screen_rect().size();
@@ -229,33 +272,25 @@ impl OverlayApp {
                 }
             }
 
-            // ── Hosting — transparent overlay with annotation rendering ────────
+            // ── Hosting ───────────────────────────────────────────────────────
             State::Hosting(mut h) => {
                 while let Ok((src_id, msg)) = h.annot_rx.try_recv() {
                     apply_annot(src_id, &msg, &h.cursors, &h.draws);
                 }
-
-                // Propagate clipboard copy requested via the tray icon menu.
                 if h.tray.pop_copy_request() {
                     ctx.output_mut(|o| o.copied_text = h.room_code.clone());
                 }
-
                 if h.tray.pop_exit_request() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-
                 while let Ok(id) = h.disconnect_rx.try_recv() {
                     h.cursors.lock().unwrap().remove_user(&UserId(id));
                     h.draws.lock().unwrap().remove_user_strokes(id);
                 }
 
-                // Room-code HUD — always visible so the user knows what to enter on the viewer.
-                // Mouse passthrough is on, so this is read-only display only.
                 egui::Window::new("backseat")
                     .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-12.0, 12.0))
-                    .resizable(false)
-                    .collapsible(false)
-                    .title_bar(false)
+                    .resizable(false).collapsible(false).title_bar(false)
                     .show(ctx, |ui| {
                         ui.label(egui::RichText::new("backseat — hosting").strong());
                         if !h.capture_ok.load(Ordering::Relaxed) {
@@ -266,14 +301,18 @@ impl OverlayApp {
                         }
                         ui.separator();
                         let current_code = h.live_code.lock().unwrap().clone();
-                        let is_short = current_code.len() == 6 && current_code.chars().all(|c| c.is_ascii_uppercase());
+                        let is_short = current_code.len() == 6
+                            && current_code.chars().all(|c| c.is_ascii_uppercase());
                         if is_short {
                             ui.horizontal(|ui| {
                                 ui.label("Code:");
                                 ui.monospace(&current_code);
                             });
                         } else {
-                            let loopback = format!("127.0.0.1:{}", current_code.split(':').last().unwrap_or("?"));
+                            let loopback = format!(
+                                "127.0.0.1:{}",
+                                current_code.split(':').last().unwrap_or("?")
+                            );
                             ui.horizontal(|ui| { ui.label("Same machine:"); ui.monospace(&loopback); });
                             ui.horizontal(|ui| { ui.label("LAN:"); ui.monospace(&h.local_code); });
                             ui.horizontal(|ui| { ui.label("WAN:"); ui.monospace(&current_code); });
@@ -291,15 +330,14 @@ impl OverlayApp {
 
             // ── Enter name + room code ────────────────────────────────────────
             State::EnteringCode { mut name, mut input, error, mut connect_rx } => {
-                // Check if the connection task finished.
                 if let Some(ref mut rx) = connect_rx {
                     if let Ok(ready) = rx.try_recv() {
                         return self.finish_join(ctx, ready, name);
                     }
                 }
 
-                let mut go_back     = false;
-                let mut go_connect  = false;
+                let mut go_back    = false;
+                let mut go_connect = false;
                 egui::Window::new("backseat")
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                     .resizable(false).collapsible(false)
@@ -309,7 +347,6 @@ impl OverlayApp {
                         ui.add_space(4.0);
                         ui.label("Room code:");
                         let resp = ui.text_edit_singleline(&mut input);
-                        // Auto-connect on Enter key.
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             go_connect = true;
                         }
@@ -335,8 +372,7 @@ impl OverlayApp {
                             return State::EnteringCode { name, input, error: None, connect_rx: Some(rx) };
                         }
                         None => return State::EnteringCode {
-                            name,
-                            input,
+                            name, input,
                             error: Some("Invalid room code (expected 6-letter code or IP:port)".into()),
                             connect_rx: None,
                         },
@@ -345,9 +381,8 @@ impl OverlayApp {
                 State::EnteringCode { name, input, error, connect_rx }
             }
 
-            // ── Joined — video + annotation canvas ────────────────────────────
+            // ── Joined ────────────────────────────────────────────────────────
             State::Joining(mut j) => {
-                // Notify the host when the viewer closes cleanly.
                 if ctx.input(|i| i.viewport().close_requested()) {
                     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
                         let _ = sock.send_to(&[0x04u8], j.host_addr);
@@ -355,7 +390,6 @@ impl OverlayApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
 
-                // Drain decoded frames, update the egui texture.
                 while let Ok(frame) = j.rgba_rx.try_recv() {
                     let img = egui::ColorImage::from_rgba_unmultiplied(
                         [frame.width as usize, frame.height as usize],
@@ -388,7 +422,6 @@ impl OverlayApp {
                             ui.label(egui::RichText::new(&j.name).strong());
                             ui.separator();
 
-                            // Pen type
                             if ui.selectable_label(j.tool.pen_type == PenType::Pen && !j.tool.eraser, "✏ Pen").clicked() {
                                 j.tool.pen_type = PenType::Pen;
                                 j.tool.eraser   = false;
@@ -399,7 +432,6 @@ impl OverlayApp {
                             }
                             ui.separator();
 
-                            // Color palette
                             for (i, &(hex, label)) in PALETTE.iter().enumerate() {
                                 let color    = crate::renderer::hex_to_color32(hex);
                                 let selected = j.tool.color_idx == i && !j.tool.eraser;
@@ -419,7 +451,6 @@ impl OverlayApp {
                             }
                             ui.separator();
 
-                            // Brush size
                             for &(label, sz) in &[("S", 2.0f32), ("M", 4.0), ("L", 8.0)] {
                                 if ui.selectable_label(j.tool.size == sz && !j.tool.eraser, label).clicked() {
                                     j.tool.size   = sz;
@@ -428,12 +459,10 @@ impl OverlayApp {
                             }
                             ui.separator();
 
-                            // Eraser
                             if ui.selectable_label(j.tool.eraser, "⌫ Eraser").clicked() {
                                 j.tool.eraser = !j.tool.eraser;
                             }
 
-                            // Clear all
                             if ui.button("🗑 Clear").clicked() {
                                 j.draws.lock().unwrap().remove_user_strokes(j.viewer_id);
                                 let msg = AnnotMsg::ClearAll;
@@ -446,9 +475,7 @@ impl OverlayApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
-                        let rect = ui.max_rect();
-
-                        // Allocate input sensing before borrowing painter.
+                        let rect     = ui.max_rect();
                         let response = ui.allocate_rect(rect, egui::Sense::drag());
                         let painter  = ui.painter();
                         let to_norm = |p: egui::Pos2| NormPoint {
@@ -456,7 +483,6 @@ impl OverlayApp {
                             y: ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0),
                         };
 
-                        // Cursor tracking (always active).
                         if let Some(pos) = response.hover_pos() {
                             let norm = to_norm(pos);
                             j.cursors.lock().unwrap().update(UserId(j.viewer_id), norm);
@@ -465,13 +491,11 @@ impl OverlayApp {
                         }
 
                         if j.tool.eraser {
-                            // Finalize any in-progress stroke if tool was switched mid-drag.
                             if let Some(sid) = j.active_stroke.take() {
                                 j.draws.lock().unwrap().end_stroke(sid);
                                 let msg = AnnotMsg::StrokeEnd { viewer_id: j.viewer_id, stroke_id: sid };
                                 let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                             }
-                            // Erase strokes near the cursor while dragging.
                             if response.dragged() || response.drag_started() {
                                 if let Some(pos) = response.interact_pointer_pos() {
                                     let norm = to_norm(pos);
@@ -495,14 +519,12 @@ impl OverlayApp {
                                     }
                                 }
                             }
-                            // Show eraser circle cursor.
                             if let Some(pos) = response.hover_pos() {
                                 const ERASE_R: f32 = 0.03;
                                 let r = ERASE_R * rect.width().min(rect.height());
                                 painter.circle_stroke(pos, r, egui::Stroke::new(2.0, egui::Color32::WHITE));
                             }
                         } else {
-                            // ── Draw mode ─────────────────────────────────────
                             if response.drag_started() {
                                 let sid = Uuid::new_v4();
                                 j.active_stroke = Some(sid);
@@ -534,7 +556,6 @@ impl OverlayApp {
                             }
                         }
 
-                        // Draw the video frame before annotations.
                         if let Some(tex) = &j.texture {
                             painter.image(
                                 tex.id(),
@@ -554,13 +575,7 @@ impl OverlayApp {
 
     // ── Background task launchers ─────────────────────────────────────────────
 
-    /// Kick off the host pipeline on the Tokio runtime and return `State::Discovering`.
-    ///
-    /// Threading model:
-    /// - OS thread: `ScreenCapture` + `Vp8Encoder` → `broadcast::Sender<Arc<Vec<u8>>>`
-    /// - Tokio task: reads from broadcast, fragments frames to UDP; receives punch/annot packets
-    /// - egui thread: drains `annot_rx` each frame, paints annotations
-    fn begin_host(&mut self) -> State {
+    fn begin_host(&mut self, audio_source: AudioSource) -> State {
         let (tx, rx) = tokio::sync::oneshot::channel::<HostReady>();
         self.rt.spawn(async move {
             let transport = match Transport::bind().await {
@@ -579,8 +594,6 @@ impl OverlayApp {
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
             let local_code = Transport::room_code(std::net::SocketAddr::new(lan_ip, local_port));
 
-            // Try to register with the rendezvous server for a short room code.
-            // Falls back to the WAN IP:port if the server is unavailable.
             let (room_code, use_signaling) = match server_url() {
                 Some(server) => {
                     let body = serde_json::json!({ "udp": wan_addr.to_string() });
@@ -614,20 +627,30 @@ impl OverlayApp {
             tracing::info!("room code (WAN): {room_code}");
             tracing::info!("room code (LAN): {local_code}");
 
-            let cursors     = Arc::new(Mutex::new(CursorState::default()));
-            let draws       = Arc::new(Mutex::new(DrawLayer::default()));
-            let capture_ok  = Arc::new(AtomicBool::new(true));
-            let (annot_tx, annot_rx) = mpsc::unbounded_channel::<(Uuid, AnnotMsg)>();
-            // _dummy holds the initial broadcast receiver so the channel isn't
-            // immediately considered closed before the transport task subscribes.
-            let (frame_tx, _dummy)   = broadcast::channel::<Arc<Vec<u8>>>(4);
-            // Signaling task → transport task: viewer's UDP address when resolved.
+            let cursors    = Arc::new(Mutex::new(CursorState::default()));
+            let draws      = Arc::new(Mutex::new(DrawLayer::default()));
+            let capture_ok = Arc::new(AtomicBool::new(true));
+            let (annot_tx, annot_rx)         = mpsc::unbounded_channel::<(Uuid, AnnotMsg)>();
+            let (frame_tx, _dummy)           = broadcast::channel::<Arc<EncodedFrame>>(4);
             let (peer_hint_tx, peer_hint_rx) = mpsc::unbounded_channel::<SocketAddr>();
+
+            // Audio capture (optional).
+            // AudioCapture is !Send (cpal::Stream), so we keep it alive on a dedicated
+            // std::thread and only pass the Send channel into the tokio task.
+            let audio_rx: Option<mpsc::UnboundedReceiver<(u32, Vec<u8>)>> =
+                if audio_source != AudioSource::None {
+                    match AudioCapture::start(audio_source) {
+                        Ok((cap, rx)) => { keepalive(cap); Some(rx) }
+                        Err(e) => { tracing::warn!("audio capture unavailable: {e}"); None }
+                    }
+                } else {
+                    None
+                };
 
             // Screen capture + VP8 encode thread.
             {
-                let tx          = frame_tx.clone();
-                let capture_ok  = Arc::clone(&capture_ok);
+                let tx         = frame_tx.clone();
+                let capture_ok = Arc::clone(&capture_ok);
                 std::thread::spawn(move || {
                     let mut cap = match ScreenCapture::new() {
                         Ok(c)  => c,
@@ -642,10 +665,10 @@ impl OverlayApp {
                         Err(e) => { tracing::warn!("encoder init failed: {e}"); return; }
                     };
                     tracing::info!("capture thread started {}x{}", cap.width, cap.height);
-                    let mut n              = 0u64;
-                    let mut consec_errors  = 0u32;
-                    let mut enc_w          = cap.width;
-                    let mut enc_h          = cap.height;
+                    let mut n             = 0u64;
+                    let mut consec_errors = 0u32;
+                    let mut enc_w         = cap.width;
+                    let mut enc_h         = cap.height;
                     loop {
                         let t = std::time::Instant::now();
                         match cap.capture() {
@@ -655,31 +678,26 @@ impl OverlayApp {
                                     capture_ok.store(true, Ordering::Relaxed);
                                     consec_errors = 0;
                                 }
-                                if let Some(encoded) = enc.encode(&bgra, n % 150 == 0) {
-                                    if n == 0 { tracing::info!("first encoded frame {} bytes", encoded.len()); }
-                                    if n % 150 == 0 { tracing::debug!("encode frame {n} → {} bytes", encoded.len()); }
-                                    let _ = tx.send(Arc::new(encoded));
-                                } else if n % 150 == 0 {
+                                let keyframe = n % 150 == 0;
+                                if let Some((data, pts)) = enc.encode(&bgra, keyframe) {
+                                    if n == 0 { tracing::info!("first encoded frame {} bytes", data.len()); }
+                                    if keyframe { tracing::debug!("encode keyframe {n} pts={pts} → {} bytes", data.len()); }
+                                    let _ = tx.send(Arc::new(EncodedFrame { data, pts, keyframe }));
+                                } else if keyframe {
                                     tracing::warn!("encode returned None at frame {n}");
                                 }
                                 n += 1;
                             }
-                            Ok(None) => {} // WouldBlock — no new frame yet
+                            Ok(None) => {}
                             Err(e) => {
                                 consec_errors += 1;
-                                if consec_errors == 1 {
-                                    tracing::warn!("capture error: {e}");
-                                }
-                                // After ~1 s of consecutive errors, try reinitialising the capturer.
-                                // This recovers from display resolution changes (e.g. Chrome Remote
-                                // Desktop resizing the screen when a client connects).
+                                if consec_errors == 1 { tracing::warn!("capture error: {e}"); }
                                 if consec_errors == 30 {
                                     tracing::info!("reinitialising capturer after {consec_errors} errors");
                                     match ScreenCapture::new() {
                                         Ok(new_cap) => {
                                             let (nw, nh) = (new_cap.width, new_cap.height);
                                             cap = new_cap;
-                                            // Rebuild encoder if resolution changed.
                                             if nw != enc_w || nh != enc_h {
                                                 tracing::info!("resolution changed {enc_w}x{enc_h} → {nw}x{nh}, rebuilding encoder");
                                                 match Vp8Encoder::new(nw as u32, nh as u32, 4_000) {
@@ -693,7 +711,7 @@ impl OverlayApp {
                                         Err(e) => {
                                             tracing::warn!("capturer reinit failed: {e}");
                                             capture_ok.store(false, Ordering::Relaxed);
-                                            consec_errors = 0; // reset so we retry again in ~1 s
+                                            consec_errors = 0;
                                         }
                                     }
                                 }
@@ -706,34 +724,30 @@ impl OverlayApp {
                 });
             }
 
-            // Transport task: send encoded frames to peer; receive annotations.
+            // Transport task: send encoded frames and audio to peers; receive annotations.
             let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<Uuid>();
             {
-                let transport    = Arc::clone(&transport);
-                let annot_tx     = annot_tx;
+                let transport     = Arc::clone(&transport);
+                let annot_tx      = annot_tx;
                 let disconnect_tx = disconnect_tx;
-                let mut frame_rx = frame_tx.subscribe();
+                let mut frame_rx  = frame_tx.subscribe();
                 let mut peer_hint_rx = peer_hint_rx;
+                let mut audio_rx  = audio_rx;
                 tokio::spawn(async move {
-                    let mut peers:    HashMap<SocketAddr, PeerInfo> = HashMap::new();
-                    let mut frame_id: u32                           = 0;
-                    let mut buf                                      = vec![0u8; 65_536];
-                    // Once the signaling task exits it drops peer_hint_tx, closing the channel.
-                    // A closed UnboundedReceiver::recv() returns None immediately on every poll,
-                    // which would starve the transport.recv() and frame_rx arms.  Guard the arm
-                    // with a flag so it is disabled once the channel is drained.
-                    let mut hint_done = false;
+                    let mut peers:          HashMap<SocketAddr, PeerInfo> = HashMap::new();
+                    let mut buf                                             = vec![0u8; 65_536];
+                    let mut hint_done                                       = false;
+                    let mut last_video_pts: u32                             = 0;
+                    let mut last_audio_pts: u32                             = 0;
+                    let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
+                    sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
                     loop {
                         tokio::select! {
-                            // Signaling server resolved the viewer's address — punch proactively.
                             hint = peer_hint_rx.recv(), if !hint_done => {
                                 match hint {
-                                    None => hint_done = true, // channel closed; disable this arm
+                                    None => hint_done = true,
                                     Some(addr) => {
-                                        // addr is the viewer's STUN-reported address — it may be the
-                                        // wrong external port if the viewer is behind symmetric NAT.
-                                        // Punch it to help open the hole; the punch handler below
-                                        // registers the real source port when the viewer's packet arrives.
                                         tracing::info!("signaling: viewer STUN addr {addr}, punching");
                                         let t = Arc::clone(&transport);
                                         tokio::spawn(async move {
@@ -745,6 +759,7 @@ impl OverlayApp {
                                     }
                                 }
                             }
+
                             res = transport.recv(&mut buf) => {
                                 if let Some((src, pkt)) = res {
                                     match pkt {
@@ -754,7 +769,10 @@ impl OverlayApp {
                                                 tracing::warn!("peer limit reached ({MAX_PEERS}), dropping punch from {src}");
                                             } else {
                                                 let new_id = {
-                                                    let entry = peers.entry(src).or_insert(PeerInfo { last_seen: Instant::now(), viewer_id: Uuid::new_v4() });
+                                                    let entry = peers.entry(src).or_insert(PeerInfo {
+                                                        last_seen: Instant::now(),
+                                                        viewer_id: Uuid::new_v4(),
+                                                    });
                                                     entry.last_seen = Instant::now();
                                                     entry.viewer_id
                                                 };
@@ -782,11 +800,11 @@ impl OverlayApp {
                                     }
                                 }
                             }
+
                             res = frame_rx.recv() => {
                                 match res {
                                     Ok(frame) => {
-                                        // Prune peers that have gone silent for > 30 s.
-                                        let now = Instant::now();
+                                        let now    = Instant::now();
                                         let before = peers.len();
                                         peers.retain(|_, info| {
                                             if now.duration_since(info.last_seen) >= Duration::from_secs(30) {
@@ -801,16 +819,35 @@ impl OverlayApp {
                                         }
 
                                         if !peers.is_empty() {
-                                            let kf = frame_id % 150 == 0;
-                                            if frame_id % 150 == 0 { tracing::debug!("host tx frame {frame_id} → {} peer(s)", peers.len()); }
                                             for &addr in peers.keys() {
-                                                let _ = transport.send_video(addr, frame_id, &frame, kf).await;
+                                                let _ = transport.send_video(addr, frame.pts, &frame.data, frame.keyframe).await;
                                             }
-                                            frame_id = frame_id.wrapping_add(1);
+                                            last_video_pts = frame.pts;
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                                     Err(broadcast::error::RecvError::Closed)    => break,
+                                }
+                            }
+
+                            audio = recv_audio(&mut audio_rx) => {
+                                if let Some((rtp_ts, data)) = audio {
+                                    last_audio_pts = rtp_ts;
+                                    for &addr in peers.keys() {
+                                        let _ = transport.send_audio(addr, rtp_ts, &data).await;
+                                    }
+                                }
+                            }
+
+                            _ = sync_tick.tick() => {
+                                if !peers.is_empty() {
+                                    let ntp_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    for &addr in peers.keys() {
+                                        let _ = transport.send_sync(addr, last_video_pts, last_audio_pts, ntp_ms).await;
+                                    }
                                 }
                             }
                         }
@@ -818,14 +855,14 @@ impl OverlayApp {
                 });
             }
 
-
             let initial_code = room_code.clone();
-            let live_code = Arc::new(Mutex::new(room_code.clone()));
-            let _ = tx.send(HostReady { transport, room_code, local_code, annot_rx, disconnect_rx, cursors, draws, capture_ok, live_code: Arc::clone(&live_code) });
+            let live_code    = Arc::new(Mutex::new(room_code.clone()));
+            let _ = tx.send(HostReady {
+                transport, room_code, local_code, annot_rx, disconnect_rx,
+                cursors, draws, capture_ok,
+                live_code: Arc::clone(&live_code),
+            });
 
-            // Long-poll /await to learn when viewers join, then loop for the next one.
-            // The code stays constant for the session; we only re-register on 404
-            // (server evicted the room after 10 min of inactivity).
             if use_signaling {
                 tokio::spawn(async move {
                     let mut current_code = initial_code;
@@ -846,10 +883,8 @@ impl OverlayApp {
                                         }
                                     }
                                 }
-                                // Loop immediately — more viewers may join on the same code.
                             }
                             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                                // Room was evicted — re-register to get a new code.
                                 tracing::info!("signaling: room {current_code} expired, re-registering");
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 match reqwest::Client::new()
@@ -870,7 +905,6 @@ impl OverlayApp {
                                 }
                             }
                             Ok(_) | Err(_) => {
-                                // 408 (no viewer this window) or transient network error — retry same code.
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
@@ -881,16 +915,6 @@ impl OverlayApp {
         State::Discovering { rx }
     }
 
-    /// Kick off the viewer pipeline and return a receiver that resolves to `State::Joining`.
-    ///
-    /// Threading model:
-    /// - Tokio task: receives `PKT_VIDEO` fragments → `Reassembler` → `sync_channel(1)`;
-    ///   sends `PKT_PUNCH` every 500 ms to keep the NAT hole open
-    /// - OS thread: `Vp8Decoder` reads from `sync_channel`, sends RGBA frames via mpsc
-    /// - egui thread: drains `rgba_rx` each frame, uploads to GPU texture
-    ///
-    /// `sync_channel(1)` is intentional: if the decoder falls behind, newer frames
-    /// overwrite the pending one so the viewer always shows the latest image.
     fn begin_join(&mut self, code: RoomCode) -> tokio::sync::oneshot::Receiver<JoinReady> {
         let (tx, rx) = tokio::sync::oneshot::channel::<JoinReady>();
         self.rt.spawn(async move {
@@ -899,28 +923,23 @@ impl OverlayApp {
                 Err(e) => { tracing::error!("UDP bind: {e}"); return; }
             };
 
-            // Resolve the host address — either directly from the room code or via signaling.
             let mut my_stun:     Option<SocketAddr> = None;
             let mut nat_warning: Option<String>     = None;
             let host_addr = match code {
                 RoomCode::Direct(addr) => addr,
                 RoomCode::Signaling(short_code) => {
-                    // STUN to learn our own public UDP address so the host can punch us back.
                     let my_udp = transport.public_addr().await.unwrap_or_else(|| {
                         let ip = crate::transport::discover_lan_ip()
                             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-                        SocketAddr::new(ip, transport.socket.local_addr()
-                            .map(|a| a.port()).unwrap_or(0))
+                        SocketAddr::new(ip, transport.socket.local_addr().map(|a| a.port()).unwrap_or(0))
                     });
                     my_stun = Some(my_udp);
                     nat_warning = crate::transport::diagnose_nat(&transport.socket).await;
-                    if let Some(ref w) = nat_warning {
-                        tracing::warn!("NAT diagnosis: {w}");
-                    }
-                    let body = serde_json::json!({ "udp": my_udp.to_string() });
+                    if let Some(ref w) = nat_warning { tracing::warn!("NAT diagnosis: {w}"); }
+                    let body   = serde_json::json!({ "udp": my_udp.to_string() });
                     let server = match server_url() {
                         Some(s) => s,
-                        None => { tracing::error!("BACKSEAT_SERVER not set"); return; }
+                        None    => { tracing::error!("BACKSEAT_SERVER not set"); return; }
                     };
                     match reqwest::Client::new()
                         .post(format!("{server}/room/{short_code}/join"))
@@ -930,18 +949,13 @@ impl OverlayApp {
                         Ok(resp) if resp.status().is_success() => {
                             if let Ok(v) = resp.json::<serde_json::Value>().await {
                                 match v["host"].as_str().and_then(|s| s.parse::<SocketAddr>().ok()) {
-                                    Some(addr) => {
-                                        tracing::info!("signaling: host is at {addr}");
-                                        addr
-                                    }
-                                    None => { tracing::error!("bad host addr from server"); return; }
+                                    Some(addr) => { tracing::info!("signaling: host is at {addr}"); addr }
+                                    None       => { tracing::error!("bad host addr from server"); return; }
                                 }
                             } else { tracing::error!("bad json from server"); return; }
                         }
-                        Ok(resp) => {
-                            tracing::error!("server returned {}", resp.status()); return;
-                        }
-                        Err(e) => { tracing::error!("signaling request failed: {e}"); return; }
+                        Ok(resp) => { tracing::error!("server returned {}", resp.status()); return; }
+                        Err(e)   => { tracing::error!("signaling request failed: {e}"); return; }
                     }
                 }
             };
@@ -949,7 +963,6 @@ impl OverlayApp {
             tracing::info!("viewer local={:?} STUN={my_stun:?} host={host_addr}",
                 transport.socket.local_addr());
 
-            // Punch through NAT — send several packets to open the hole.
             for i in 0..5 {
                 match transport.send_punch(host_addr).await {
                     Ok(()) => tracing::debug!("punch {i} → {host_addr} ok"),
@@ -963,7 +976,16 @@ impl OverlayApp {
             let (annot_out_tx, mut annot_out_rx) = mpsc::unbounded_channel::<String>();
             let viewer_id = Uuid::new_v4();
 
-            // VP8 decode thread → RGBA.
+            // Audio player (best-effort — carry on without audio on failure).
+            // AudioPlayer is !Send (cpal::Stream), so keep it alive on a dedicated
+            // std::thread and only pass the Send channel into the async task.
+            let audio_pkt_tx: Option<mpsc::UnboundedSender<(u32, Vec<u8>)>> =
+                match AudioPlayer::new() {
+                    Ok((player, sender)) => { keepalive(player); Some(sender) }
+                    Err(e) => { tracing::warn!("audio player unavailable: {e}"); None }
+                };
+
+            // VP8 decode thread.
             std::thread::spawn(move || {
                 let mut dec = match Vp8Decoder::new() {
                     Ok(d)  => d,
@@ -984,15 +1006,12 @@ impl OverlayApp {
                 tracing::warn!("decode thread exiting");
             });
 
-            // Transport task: recv video fragments + send annotations.
+            // Transport task.
             {
                 let transport = Arc::clone(&transport);
                 tokio::spawn(async move {
                     let mut reassembler = Reassembler::new();
-                    let mut buf = vec![0u8; 65_536];
-                    // Track the actual address the host's packets arrive from — may differ from
-                    // host_addr (the room code) when both peers are on the same machine or behind
-                    // NAT that doesn't do hairpinning.
+                    let mut buf         = vec![0u8; 65_536];
                     let mut actual_host: Option<std::net::SocketAddr> = None;
                     let mut punch_ticker = tokio::time::interval(Duration::from_millis(500));
                     punch_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1005,8 +1024,13 @@ impl OverlayApp {
                                     Err(e) => tracing::warn!("periodic punch failed: {e}"),
                                 }
                             }
+
                             res = transport.recv(&mut buf) => {
                                 if let Some((src, pkt)) = res {
+                                    let from_host = match actual_host {
+                                        Some(h) => src == h,
+                                        None    => src == host_addr || src.port() == host_addr.port(),
+                                    };
                                     match pkt {
                                         Packet::Punch => {
                                             if actual_host.is_none() {
@@ -1014,29 +1038,40 @@ impl OverlayApp {
                                                 actual_host = Some(src);
                                             }
                                         }
-                                        Packet::VideoFrag { frame_id, frag_idx, frag_total, keyframe, data } => {
-                                            let accepted = match actual_host {
-                                                Some(h) => src == h,
-                                                None    => src == host_addr || src.port() == host_addr.port(),
-                                            };
-                                            if !accepted {
+                                        Packet::VideoFrag { rtp_ts, frag_idx, frag_total, keyframe, data, .. } => {
+                                            if !from_host {
                                                 tracing::warn!("video from unexpected {src} (expected {host_addr} / {actual_host:?}) — dropping");
                                             } else {
                                                 if actual_host.is_none() {
                                                     tracing::info!("host video from {src} — locking as actual_host");
                                                     actual_host = Some(src);
                                                 }
-                                                tracing::debug!("rx frag frame={frame_id} {frag_idx}/{frag_total} kf={keyframe}");
-                                                if let Some((frame, _)) = reassembler.push(frame_id, frag_idx, frag_total, keyframe, data) {
-                                                    tracing::debug!("reassembled frame {frame_id} ({} bytes)", frame.len());
+                                                tracing::debug!("rx frag rtp_ts={rtp_ts} {frag_idx}/{frag_total} kf={keyframe}");
+                                                if let Some((frame, _)) = reassembler.push(rtp_ts, frag_idx, frag_total, keyframe, data) {
+                                                    tracing::debug!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
                                                     let _ = frame_sync_tx.try_send(frame);
                                                 }
+                                            }
+                                        }
+                                        Packet::Audio { rtp_ts, data, .. } => {
+                                            if from_host {
+                                                if let Some(ref tx) = audio_pkt_tx {
+                                                    let _ = tx.send((rtp_ts, data));
+                                                }
+                                            }
+                                        }
+                                        Packet::Sync { video_ts, audio_ts, ntp_ms } => {
+                                            if from_host {
+                                                tracing::debug!(
+                                                    "a/v sync anchor: video_ts={video_ts} audio_ts={audio_ts} ntp_ms={ntp_ms}"
+                                                );
                                             }
                                         }
                                         _ => {}
                                     }
                                 }
                             }
+
                             Some(json) = annot_out_rx.recv() => {
                                 let target = actual_host.unwrap_or(host_addr);
                                 let _ = transport.send_annot(target, &json).await;
@@ -1046,13 +1081,14 @@ impl OverlayApp {
                 });
             }
 
-            let _ = tx.send(JoinReady { transport, rgba_rx, annot_out: annot_out_tx, viewer_id, host_addr, nat_warning });
+            let _ = tx.send(JoinReady {
+                transport, rgba_rx, annot_out: annot_out_tx,
+                viewer_id, host_addr, nat_warning,
+            });
         });
         rx
     }
 
-    /// Called once `JoinReady` arrives.  Restores a normal windowed viewport
-    /// (the host runs fullscreen + passthrough; the viewer needs a regular interactive window).
     fn finish_join(&self, ctx: &egui::Context, ready: JoinReady, name: String) -> State {
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -1064,7 +1100,6 @@ impl OverlayApp {
             name.trim().to_string()
         };
 
-        // Tell the host our chosen name immediately.
         let register = AnnotMsg::Register { viewer_id: ready.viewer_id, name: display_name.clone() };
         let _ = ready.annot_out.send(serde_json::to_string(&register).unwrap());
 
@@ -1095,9 +1130,6 @@ impl OverlayApp {
 
 // ── Annotation application (host side) ───────────────────────────────────────
 
-/// Apply one incoming annotation message to the shared host state.
-/// Auto-registers unknown viewers on first `CursorMove` using a deterministic colour
-/// derived from the viewer UUID so the same viewer always gets the same colour.
 fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
     match msg {
         AnnotMsg::Register { name, .. } => {
@@ -1117,7 +1149,6 @@ fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, 
         AnnotMsg::CursorMove { pos, .. } => {
             let mut c = cursors.lock().unwrap();
             if !c.users.contains_key(&src_id) {
-                // Fallback: Register wasn't received first (UDP reorder).
                 let palette = ["#e05c5c","#5c9ee0","#5ce07a","#e0c25c","#b05ce0","#5ce0d4"];
                 let color   = palette[(src_id.as_u128() % palette.len() as u128) as usize];
                 c.add_user(UserInfo {
@@ -1148,14 +1179,21 @@ fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, 
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Base URL of the rendezvous server.  Override at runtime with `BACKSEAT_SERVER`
-/// (useful for self-hosting or local dev).  Update this constant before shipping
-/// a release build once the server is deployed.
 const SERVER_URL: &str = "https://backseat.fly.dev";
 
 fn server_url() -> Option<String> {
     let url = std::env::var("BACKSEAT_SERVER").unwrap_or_else(|_| SERVER_URL.to_string());
     if url.is_empty() { None } else { Some(url) }
+}
+
+/// Drive an optional audio receiver without spinning: returns `None` forever when absent.
+async fn recv_audio(
+    rx: &mut Option<mpsc::UnboundedReceiver<(u32, Vec<u8>)>>,
+) -> Option<(u32, Vec<u8>)> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None     => std::future::pending().await,
+    }
 }
 
 // ── eframe integration ────────────────────────────────────────────────────────
@@ -1172,13 +1210,6 @@ impl eframe::App for OverlayApp {
     }
 }
 
-/// Set `_NET_WM_WINDOW_TYPE_NOTIFICATION` on the overlay window.
-///
-/// GNOME/Mutter places notification-type windows above all normal windows,
-/// independent of focus changes — unlike `_NET_WM_STATE_ABOVE`, which Mutter
-/// overrides when another window is raised.  The type is set here, immediately
-/// after eframe creates the window, via a fresh RustConnection so we don't
-/// interfere with winit's own xcb state.
 #[cfg(target_os = "linux")]
 fn x11_set_notification_type(cc: &eframe::CreationContext) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1218,7 +1249,7 @@ fn x11_set_notification_type(cc: &eframe::CreationContext) {
     let cookie = match conn.change_property32(PropMode::REPLACE, window_id, wm_type,
                                               AtomEnum::ATOM, &[notification])
     {
-        Ok(c) => c,
+        Ok(c)  => c,
         Err(e) => { tracing::warn!("x11 overlay type: change_property failed: {e}"); return; }
     };
     if let Err(e) = cookie.check() {

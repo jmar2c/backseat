@@ -70,18 +70,21 @@ impl Vp8Encoder {
         }
     }
 
-    /// Encode one BGRA frame.  Returns the raw VP8 bitstream or `None` on error.
-    /// Pass `force_keyframe = true` every N frames to aid decoder recovery.
-    pub fn encode(&mut self, bgra: &[u8], force_keyframe: bool) -> Option<Vec<u8>> {
+    /// Encode one BGRA frame.
+    ///
+    /// Returns `(vp8_bitstream, rtp_ts)` where `rtp_ts` is the 90 kHz presentation
+    /// timestamp used for this frame — pass it directly to [`Transport::send_video`].
+    pub fn encode(&mut self, bgra: &[u8], force_keyframe: bool) -> Option<(Vec<u8>, u32)> {
         unsafe {
             self.fill_i420(bgra);
 
-            let flags = if force_keyframe { VPX_EFLAG_FORCE_KF as _ } else { 0 };
+            let pts_used = self.pts;
+            let flags    = if force_keyframe { VPX_EFLAG_FORCE_KF as _ } else { 0 };
 
             let err = vpx_codec_encode(
                 &mut self.ctx,
                 self.image,
-                self.pts,
+                pts_used,
                 1,
                 flags,
                 VPX_DL_REALTIME as _,
@@ -106,7 +109,7 @@ impl Vp8Encoder {
                 }
             }
 
-            if out.is_empty() { None } else { Some(out) }
+            if out.is_empty() { None } else { Some((out, pts_used as u32)) }
         }
     }
 
