@@ -627,9 +627,10 @@ impl OverlayApp {
             tracing::info!("room code (WAN): {room_code}");
             tracing::info!("room code (LAN): {local_code}");
 
-            let cursors    = Arc::new(Mutex::new(CursorState::default()));
-            let draws      = Arc::new(Mutex::new(DrawLayer::default()));
-            let capture_ok = Arc::new(AtomicBool::new(true));
+            let cursors      = Arc::new(Mutex::new(CursorState::default()));
+            let draws        = Arc::new(Mutex::new(DrawLayer::default()));
+            let capture_ok   = Arc::new(AtomicBool::new(true));
+            let keyframe_req = Arc::new(AtomicBool::new(false));
             let (annot_tx, annot_rx)         = mpsc::unbounded_channel::<(Uuid, AnnotMsg)>();
             let (frame_tx, _dummy)           = broadcast::channel::<Arc<EncodedFrame>>(4);
             let (peer_hint_tx, peer_hint_rx) = mpsc::unbounded_channel::<SocketAddr>();
@@ -649,8 +650,9 @@ impl OverlayApp {
 
             // Screen capture + VP8 encode thread.
             {
-                let tx         = frame_tx.clone();
-                let capture_ok = Arc::clone(&capture_ok);
+                let tx           = frame_tx.clone();
+                let capture_ok   = Arc::clone(&capture_ok);
+                let keyframe_req = Arc::clone(&keyframe_req);
                 std::thread::spawn(move || {
                     let mut cap = match ScreenCapture::new() {
                         Ok(c)  => c,
@@ -678,7 +680,8 @@ impl OverlayApp {
                                     capture_ok.store(true, Ordering::Relaxed);
                                     consec_errors = 0;
                                 }
-                                let keyframe = n % 150 == 0;
+                                let keyframe = n % 150 == 0
+                                    || keyframe_req.swap(false, Ordering::Relaxed);
                                 if let Some((data, pts)) = enc.encode(&bgra, keyframe) {
                                     if n == 0 { tracing::info!("first encoded frame {} bytes", data.len()); }
                                     if keyframe { tracing::debug!("encode keyframe {n} pts={pts} → {} bytes", data.len()); }
@@ -733,6 +736,7 @@ impl OverlayApp {
                 let mut frame_rx  = frame_tx.subscribe();
                 let mut peer_hint_rx = peer_hint_rx;
                 let mut audio_rx  = audio_rx;
+                let keyframe_req  = Arc::clone(&keyframe_req);
                 tokio::spawn(async move {
                     let mut peers:          HashMap<SocketAddr, PeerInfo> = HashMap::new();
                     let mut buf                                             = vec![0u8; 65_536];
@@ -776,7 +780,10 @@ impl OverlayApp {
                                                     entry.last_seen = Instant::now();
                                                     entry.viewer_id
                                                 };
-                                                if is_new { tracing::info!("new peer {src} id={new_id} (total: {})", peers.len()); }
+                                                if is_new {
+                                                    tracing::info!("new peer {src} id={new_id} (total: {})", peers.len());
+                                                    keyframe_req.store(true, Ordering::Relaxed);
+                                                }
                                                 let _ = transport.send_punch(src).await;
                                             }
                                         }
