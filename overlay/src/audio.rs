@@ -37,11 +37,12 @@ pub struct AudioDeviceInfo {
     pub is_monitor: bool,
 }
 
-/// Probe available input devices.  Returns `(has_monitor, device_list)`.
+/// Probe available input devices.  Returns `(has_desktop_audio, device_list)`.
 ///
-/// On Linux, desktop-audio monitor sources live in PulseAudio/PipeWire and are
-/// not visible to the ALSA enumerator cpal uses by default.  We detect them via
-/// `pactl list short sources` and look for sources whose name ends in `.monitor`.
+/// Linux: desktop audio is available when a PulseAudio/PipeWire monitor source
+/// exists (`pactl list short sources`).
+/// Windows: desktop audio is always available via WASAPI loopback as long as
+/// there is a default output device.
 pub fn probe_devices() -> (bool, Vec<AudioDeviceInfo>) {
     let host = cpal::default_host();
     let Ok(devs) = host.input_devices() else { return (false, vec![]) };
@@ -51,12 +52,20 @@ pub fn probe_devices() -> (bool, Vec<AudioDeviceInfo>) {
             Some(AudioDeviceInfo { name, is_monitor: false })
         })
         .collect();
-    let has_monitor = pulse_monitor_source().is_some();
-    (has_monitor, infos)
+
+    #[cfg(target_os = "linux")]
+    let has_desktop = pulse_monitor_source().is_some();
+    #[cfg(target_os = "windows")]
+    let has_desktop = host.default_output_device().is_some();
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let has_desktop = false;
+
+    (has_desktop, infos)
 }
 
 /// Ask PulseAudio/PipeWire for the name of the first available monitor source.
 /// Returns `None` if `pactl` is unavailable or no monitor sources exist.
+#[cfg(target_os = "linux")]
 fn pulse_monitor_source() -> Option<String> {
     let out = std::process::Command::new("pactl")
         .args(["list", "short", "sources"])
@@ -146,24 +155,34 @@ fn open_input_device(source: AudioSource) -> Result<cpal::Device, String> {
             .default_input_device()
             .ok_or_else(|| "no default input device".into()),
         AudioSource::Desktop => {
-            // PulseAudio/PipeWire monitor sources are not visible to the ALSA
-            // enumerator.  Route to one by setting PULSE_SOURCE before opening
-            // the PulseAudio ALSA device ("pulse").
-            //
-            // Requires: libasound2-plugins (provides the "pulse" ALSA device).
-            match pulse_monitor_source() {
-                Some(monitor_name) => {
-                    tracing::info!("audio: desktop capture via monitor source '{monitor_name}'");
-                    // Tell PulseAudio/PipeWire which source to use when the default
-                    // ALSA capture device is opened.  cpal's ALSA enumerator only
-                    // lists hardware cards, not virtual plugins, so we use the
-                    // default input device (which routes through PulseAudio on
-                    // most desktop Linux systems) rather than searching for "pulse".
-                    unsafe { std::env::set_var("PULSE_SOURCE", &monitor_name); }
-                    host.default_input_device()
-                        .ok_or_else(|| "no default input device".into())
+            #[cfg(target_os = "linux")]
+            {
+                // PulseAudio/PipeWire monitor sources are not visible to the ALSA
+                // enumerator. Set PULSE_SOURCE then open the default input device,
+                // which routes through PulseAudio on most desktop Linux systems.
+                // Requires: libasound2-plugins (provides the "pulse" ALSA device).
+                match pulse_monitor_source() {
+                    Some(monitor_name) => {
+                        tracing::info!("audio: desktop capture via monitor source '{monitor_name}'");
+                        unsafe { std::env::set_var("PULSE_SOURCE", &monitor_name); }
+                        host.default_input_device()
+                            .ok_or_else(|| "no default input device".into())
+                    }
+                    None => Err("no PulseAudio/PipeWire monitor source found".into()),
                 }
-                None => Err("no PulseAudio/PipeWire monitor source found".into()),
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // WASAPI loopback: open the render (output) device as a loopback
+                // input. cpal's WASAPI backend uses AUDCLNT_STREAMFLAGS_LOOPBACK
+                // automatically when build_input_stream is called on a render device.
+                tracing::info!("audio: desktop capture via WASAPI loopback");
+                host.default_output_device()
+                    .ok_or_else(|| "no default output device for loopback".into())
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            {
+                Err("desktop audio not supported on this platform".into())
             }
         }
     }
