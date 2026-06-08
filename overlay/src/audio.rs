@@ -102,28 +102,35 @@ impl AudioCapture {
             AudioSource::Desktop => crate::opus::Application::Audio,
             _                    => crate::opus::Application::Voip,
         };
-        let device = open_input_device(source)?;
+        let device = open_input_device(&source)?;
 
-        let config = cpal::StreamConfig {
-            channels:    1,
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
-            buffer_size: cpal::BufferSize::Default,
-        };
+        // WASAPI loopback must use the device's native mix format (channels + rate).
+        // For all other sources request mono 48 kHz and let the driver negotiate.
+        let (config, device_channels) = native_capture_config(&device, &source)?;
 
         let (tx, rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
 
-        let mut enc = crate::opus::OpusEncoder::new(SAMPLE_RATE, 1, app_type)
+        let mut enc = crate::opus::OpusEncoder::new(config.sample_rate.0, 1, app_type)
             .map_err(|e| format!("opus encoder: {e}"))?;
-        let mut sample_buf: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 2);
+        let frame_size = (config.sample_rate.0 as usize) / 50; // 20 ms
+        let mut sample_buf: Vec<f32> = Vec::with_capacity(frame_size * 2);
         let mut rtp_ts: u32          = 0;
 
         let stream = device
             .build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    sample_buf.extend_from_slice(data);
-                    while sample_buf.len() >= FRAME_SIZE {
-                        let frame: Vec<f32> = sample_buf.drain(..FRAME_SIZE).collect();
+                    // Downmix multi-channel to mono by averaging across channels.
+                    if device_channels == 1 {
+                        sample_buf.extend_from_slice(data);
+                    } else {
+                        sample_buf.extend(
+                            data.chunks_exact(device_channels)
+                                .map(|ch| ch.iter().copied().sum::<f32>() / device_channels as f32)
+                        );
+                    }
+                    while sample_buf.len() >= frame_size {
+                        let frame: Vec<f32> = sample_buf.drain(..frame_size).collect();
                         let mut out = vec![0u8; 4096];
                         match enc.encode_float(&frame, &mut out) {
                             Ok(len) => {
@@ -132,7 +139,7 @@ impl AudioCapture {
                             }
                             Err(e) => tracing::warn!("opus encode: {e}"),
                         }
-                        rtp_ts = rtp_ts.wrapping_add(FRAME_SIZE as u32);
+                        rtp_ts = rtp_ts.wrapping_add(frame_size as u32);
                     }
                 },
                 |err| tracing::warn!("audio capture error: {err}"),
@@ -147,7 +154,7 @@ impl AudioCapture {
     }
 }
 
-fn open_input_device(source: AudioSource) -> Result<cpal::Device, String> {
+fn open_input_device(source: &AudioSource) -> Result<cpal::Device, String> {
     let host = cpal::default_host();
     match source {
         AudioSource::None => Err("no audio source selected".into()),
@@ -186,6 +193,39 @@ fn open_input_device(source: AudioSource) -> Result<cpal::Device, String> {
             }
         }
     }
+}
+
+/// Return the `StreamConfig` and channel count to use for capturing from `device`.
+///
+/// WASAPI loopback requires the stream config to exactly match the render device's
+/// mix format.  For all other sources we request mono 48 kHz and let the driver
+/// negotiate; if that fails the caller receives an informative error.
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+fn native_capture_config(
+    device: &cpal::Device,
+    source: &AudioSource,
+) -> Result<(cpal::StreamConfig, usize), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use cpal::traits::DeviceTrait;
+        if *source == AudioSource::Desktop {
+            let supported = device.default_output_config()
+                .map_err(|e| format!("could not query output device config: {e}"))?;
+            let channels = supported.channels() as usize;
+            tracing::info!("WASAPI loopback: {channels}ch {}Hz", supported.sample_rate().0);
+            return Ok((cpal::StreamConfig {
+                channels:    channels as u16,
+                sample_rate: supported.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            }, channels));
+        }
+    }
+
+    Ok((cpal::StreamConfig {
+        channels:    1,
+        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+        buffer_size: cpal::BufferSize::Default,
+    }, 1))
 }
 
 // ── Playback ──────────────────────────────────────────────────────────────────
