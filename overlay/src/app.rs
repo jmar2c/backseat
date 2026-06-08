@@ -331,7 +331,6 @@ impl OverlayApp {
                         if let Some(wid) = self.x11_window_id {
                             x11_set_notification_type(wid);
                         }
-                        #[cfg(target_os = "linux")]
                         {
                             let sz = ctx.input(|i| i.viewport().monitor_size)
                                 .unwrap_or_else(|| ctx.screen_rect().size());
@@ -339,8 +338,6 @@ impl OverlayApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
                             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sz));
                         }
-                        #[cfg(not(target_os = "linux"))]
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                         let tray = crate::tray::HostTray::new(ready.room_code.clone());
                         State::Hosting(HostCtx {
