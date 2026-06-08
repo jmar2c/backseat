@@ -1038,7 +1038,7 @@ impl OverlayApp {
                                 if let Some((src, pkt)) = res {
                                     let from_host = match actual_host {
                                         Some(h) => src == h,
-                                        None    => src == host_addr || src.port() == host_addr.port(),
+                                        None    => src == host_addr,
                                     };
                                     match pkt {
                                         Packet::Punch => {
