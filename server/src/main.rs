@@ -32,7 +32,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
 
 // Maximum number of pending viewer addresses queued per room.
 const MAX_PENDING: usize = 50;
@@ -185,6 +185,7 @@ async fn main() {
     // (set by Fly's proxy) then falls back to ConnectInfo.
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
+            .key_extractor(SmartIpKeyExtractor)
             .per_second(10)
             .burst_size(30)
             .finish()

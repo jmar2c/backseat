@@ -352,12 +352,16 @@ async fn stun_query(socket: &UdpSocket, stun_host: &str) -> Option<SocketAddr> {
     socket.send_to(&req, stun_addr).await.ok()?;
 
     let mut buf = [0u8; 512];
-    let (n, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        socket.recv_from(&mut buf),
-    ).await.ok()?.ok()?;
-
-    parse_xor_mapped_address(&buf[..n])
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let (n, from) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf))
+            .await.ok()?.ok()?;
+        if from != stun_addr { continue; }
+        let data = &buf[..n];
+        if data.len() >= 20 && data[8..20] == req[8..20] {
+            return parse_xor_mapped_address(data);
+        }
+    }
 }
 
 fn parse_xor_mapped_address(buf: &[u8]) -> Option<SocketAddr> {

@@ -1142,6 +1142,7 @@ impl OverlayApp {
 fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
     match msg {
         AnnotMsg::Register { name } => {
+            let name = name.chars().take(64).collect::<String>();
             let mut c = cursors.lock().unwrap();
             if let Some(user) = c.users.get_mut(&src_id) {
                 user.name = name.clone();
@@ -1170,7 +1171,8 @@ fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, 
         }
         AnnotMsg::StrokeBegin { stroke_id, pos, width, color, alpha } => {
             let color = color.chars().take(7).collect::<String>();
-            draws.lock().unwrap().begin_stroke(UserId(src_id), *stroke_id, *pos, *width, color, *alpha);
+            let width = width.clamp(0.5, 50.0);
+            draws.lock().unwrap().begin_stroke(UserId(src_id), *stroke_id, *pos, width, color, *alpha);
         }
         AnnotMsg::StrokePoint { stroke_id, pos } => {
             draws.lock().unwrap().add_point(UserId(src_id), *stroke_id, *pos);
