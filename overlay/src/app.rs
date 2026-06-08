@@ -180,18 +180,32 @@ enum State {
 pub struct OverlayApp {
     state: State,
     rt:    tokio::runtime::Runtime,
+    #[cfg(target_os = "linux")]
+    x11_window_id: Option<u32>,
 }
 
 impl OverlayApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         #[cfg(target_os = "linux")]
-        x11_set_notification_type(cc);
+        let x11_window_id = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            match cc.window_handle().ok().map(|h| h.as_raw()) {
+                Some(RawWindowHandle::Xcb(h))  => Some(h.window.get()),
+                Some(RawWindowHandle::Xlib(h)) => Some(h.window as u32),
+                _ => None,
+            }
+        };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        Self { state: State::ChoosingMode, rt }
+        Self {
+            state: State::ChoosingMode,
+            rt,
+            #[cfg(target_os = "linux")]
+            x11_window_id,
+        }
     }
 
     fn step(&mut self, ctx: &egui::Context, state: State) -> State {
@@ -201,16 +215,35 @@ impl OverlayApp {
             State::ChoosingMode => {
                 let mut clicked_host = false;
                 let mut clicked_join = false;
-                egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |_| {});
-                egui::Window::new("backseat")
-                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                    .resizable(false).collapsible(false)
-                    .show(ctx, |ui| {
+                let mut close = false;
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let title_row = ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("backseat").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            close = ui.small_button("x").clicked();
+                        });
+                    });
+                    let drag = ui.interact(
+                        title_row.response.rect,
+                        ui.id().with("titlebar_drag"),
+                        egui::Sense::drag(),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    ui.separator();
+                    let remaining = ui.available_height();
+                    ui.add_space((remaining - 24.0).max(0.0) / 2.0);
+                    ui.vertical_centered(|ui| {
                         ui.horizontal(|ui| {
                             clicked_host = ui.button("  Host  ").clicked();
                             clicked_join = ui.button("  Join  ").clicked();
                         });
                     });
+                });
+                if close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 if clicked_host {
                     let (has_monitor, _) = crate::audio::probe_devices();
                     return State::ConfiguringHost {
@@ -232,31 +265,39 @@ impl OverlayApp {
                 let mut go_back  = false;
                 let mut go_start = false;
 
-                egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |_| {});
-                egui::Window::new("backseat — host settings")
-                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                    .resizable(false).collapsible(false)
-                    .show(ctx, |ui| {
-                        ui.label(egui::RichText::new("Audio source").strong());
-                        ui.add_space(4.0);
-                        ui.radio_value(&mut audio_source, AudioSource::None,       "None");
-                        ui.radio_value(&mut audio_source, AudioSource::Microphone, "Microphone");
-                        ui.add_enabled_ui(has_monitor, |ui| {
-                            ui.radio_value(&mut audio_source, AudioSource::Desktop, "Desktop audio");
-                        });
-                        if !has_monitor {
-                            ui.label(
-                                egui::RichText::new("(desktop audio not available — no monitor source found)")
-                                    .small()
-                                    .color(egui::Color32::GRAY),
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            go_back  = ui.button("Back").clicked();
-                            go_start = ui.button("Start Hosting").clicked();
-                        });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let title_row = ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("backseat — host settings").strong());
                     });
+                    let drag = ui.interact(
+                        title_row.response.rect,
+                        ui.id().with("titlebar_drag"),
+                        egui::Sense::drag(),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Audio source").strong());
+                    ui.add_space(4.0);
+                    ui.radio_value(&mut audio_source, AudioSource::None,       "None");
+                    ui.radio_value(&mut audio_source, AudioSource::Microphone, "Microphone");
+                    ui.add_enabled_ui(has_monitor, |ui| {
+                        ui.radio_value(&mut audio_source, AudioSource::Desktop, "Desktop audio");
+                    });
+                    if !has_monitor {
+                        ui.label(
+                            egui::RichText::new("(desktop audio not available — no monitor source found)")
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        go_back  = ui.button("Back").clicked();
+                        go_start = ui.button("Start Hosting").clicked();
+                    });
+                });
 
                 if go_back  { return State::ChoosingMode; }
                 if go_start { return self.begin_host(audio_source); }
@@ -265,19 +306,41 @@ impl OverlayApp {
 
             // ── Waiting for STUN ──────────────────────────────────────────────
             State::Discovering { mut rx } => {
-                egui::Window::new("backseat")
-                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                    .resizable(false).collapsible(false)
-                    .show(ctx, |ui| { ui.label("Discovering public address…"); });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let title_row = ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("backseat").strong());
+                    });
+                    let drag = ui.interact(
+                        title_row.response.rect,
+                        ui.id().with("titlebar_drag"),
+                        egui::Sense::drag(),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    ui.separator();
+                    let remaining = ui.available_height();
+                    ui.add_space((remaining - 20.0).max(0.0) / 2.0);
+                    ui.vertical_centered(|ui| { ui.label("Discovering public address…"); });
+                });
                 match rx.try_recv() {
                     Ok(ready) => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                        #[cfg(target_os = "linux")]
+                        if let Some(wid) = self.x11_window_id {
+                            x11_set_notification_type(wid);
+                        }
                         #[cfg(target_os = "linux")]
                         {
-                            let sz = ctx.screen_rect().size();
+                            let sz = ctx.input(|i| i.viewport().monitor_size)
+                                .unwrap_or_else(|| ctx.screen_rect().size());
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
                             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sz));
                         }
+                        #[cfg(not(target_os = "linux"))]
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                         let tray = crate::tray::HostTray::new(ready.room_code.clone());
                         State::Hosting(HostCtx {
@@ -375,7 +438,18 @@ impl OverlayApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                        let rect = ui.max_rect();
+                        // Correct for any WM-imposed offset (e.g. taskbar struts pushing
+                        // the window down). NormPoints are relative to the full monitor, so
+                        // the drawing rect must also be expressed in window-local coords
+                        // that span the full monitor — even if that extends above the window.
+                        let win_min = ctx.input(|i| i.viewport().inner_rect.map(|r| r.min))
+                            .unwrap_or(egui::Pos2::ZERO);
+                        let monitor = ctx.input(|i| i.viewport().monitor_size)
+                            .unwrap_or_else(|| ui.max_rect().size());
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(-win_min.x, -win_min.y),
+                            monitor,
+                        );
                         crate::renderer::paint_stickers(ui.painter(), rect, &h.stickers);
                         crate::renderer::paint(ui.painter(), rect, &h.draws, &h.cursors);
                     });
@@ -393,31 +467,40 @@ impl OverlayApp {
 
                 let mut go_back    = false;
                 let mut go_connect = false;
-                egui::Window::new("backseat")
-                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                    .resizable(false).collapsible(false)
-                    .show(ctx, |ui| {
-                        ui.label("Your name:");
-                        ui.text_edit_singleline(&mut name);
-                        ui.add_space(4.0);
-                        ui.label("Room code:");
-                        let resp = ui.text_edit_singleline(&mut input);
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            go_connect = true;
-                        }
-                        if let Some(ref e) = error {
-                            ui.colored_label(egui::Color32::RED, e);
-                        }
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            if connect_rx.is_some() {
-                                ui.label("Connecting…");
-                            } else {
-                                go_connect |= ui.button("Connect").clicked();
-                            }
-                            go_back = ui.button("Back").clicked();
-                        });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let title_row = ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("backseat — join").strong());
                     });
+                    let drag = ui.interact(
+                        title_row.response.rect,
+                        ui.id().with("titlebar_drag"),
+                        egui::Sense::drag(),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    ui.separator();
+                    ui.label("Your name:");
+                    ui.text_edit_singleline(&mut name);
+                    ui.add_space(4.0);
+                    ui.label("Room code:");
+                    let resp = ui.text_edit_singleline(&mut input);
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        go_connect = true;
+                    }
+                    if let Some(ref e) = error {
+                        ui.colored_label(egui::Color32::RED, e);
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if connect_rx.is_some() {
+                            ui.label("Connecting…");
+                        } else {
+                            go_connect |= ui.button("Connect").clicked();
+                        }
+                        go_back = ui.button("Back").clicked();
+                    });
+                });
 
                 if go_back { return State::ChoosingMode; }
                 if go_connect && connect_rx.is_none() {
@@ -1422,6 +1505,8 @@ impl OverlayApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
 
         let display_name = if name.trim().is_empty() {
             format!("viewer-{}", &ready.viewer_id.to_string()[..4])
@@ -1648,21 +1733,11 @@ impl eframe::App for OverlayApp {
 }
 
 #[cfg(target_os = "linux")]
-fn x11_set_notification_type(cc: &eframe::CreationContext) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+fn x11_set_notification_type(window_id: u32) {
     use x11rb::connection::Connection as _;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
     use x11rb::rust_connection::RustConnection;
     use x11rb::wrapper::ConnectionExt as _;
-
-    let window_id: u32 = match cc.window_handle().ok().map(|h| h.as_raw()) {
-        Some(RawWindowHandle::Xcb(h))  => h.window.get(),
-        Some(RawWindowHandle::Xlib(h)) => h.window as u32,
-        _ => {
-            tracing::warn!("x11 overlay type: unrecognised window handle — skipping");
-            return;
-        }
-    };
 
     let conn = match RustConnection::connect(None) {
         Ok((c, _)) => c,

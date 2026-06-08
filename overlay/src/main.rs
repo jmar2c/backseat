@@ -29,10 +29,9 @@ fn main() {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
-            .with_always_on_top()
             .with_decorations(false)
-            .with_fullscreen(true)
-            .with_mouse_passthrough(false), // interactive until host mode activated
+            .with_mouse_passthrough(false) // interactive until host mode activated
+            .with_inner_size(egui::vec2(320.0, 240.0)),
         ..Default::default()
     };
 
