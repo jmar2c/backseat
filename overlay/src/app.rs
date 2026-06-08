@@ -91,7 +91,7 @@ struct HostReady {
     transport:     Arc<Transport>,
     room_code:     String,
     local_code:    String,
-    annot_rx:      mpsc::UnboundedReceiver<(Uuid, AnnotMsg)>,
+    annot_rx:      mpsc::Receiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
     cursors:       Arc<Mutex<CursorState>>,
     draws:         Arc<Mutex<DrawLayer>>,
@@ -103,7 +103,7 @@ struct HostCtx {
     room_code:     String,
     local_code:    String,
     _transport:    Arc<Transport>,
-    annot_rx:      mpsc::UnboundedReceiver<(Uuid, AnnotMsg)>,
+    annot_rx:      mpsc::Receiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
     cursors:       Arc<Mutex<CursorState>>,
     draws:         Arc<Mutex<DrawLayer>>,
@@ -631,7 +631,7 @@ impl OverlayApp {
             let draws        = Arc::new(Mutex::new(DrawLayer::default()));
             let capture_ok   = Arc::new(AtomicBool::new(true));
             let keyframe_req = Arc::new(AtomicBool::new(false));
-            let (annot_tx, annot_rx)         = mpsc::unbounded_channel::<(Uuid, AnnotMsg)>();
+            let (annot_tx, annot_rx)         = mpsc::channel::<(Uuid, AnnotMsg)>(1_024);
             let (frame_tx, _dummy)           = broadcast::channel::<Arc<EncodedFrame>>(4);
             let (peer_hint_tx, peer_hint_rx) = mpsc::unbounded_channel::<SocketAddr>();
 
@@ -793,7 +793,9 @@ impl OverlayApp {
                                             }
                                             if let Ok(msg) = serde_json::from_str::<AnnotMsg>(&json) {
                                                 if let Some(peer) = peers.get(&src) {
-                                                    let _ = annot_tx.send((peer.viewer_id, msg));
+                                                    if annot_tx.try_send((peer.viewer_id, msg)).is_err() {
+                                                        tracing::warn!("annot channel full, dropping from {src}");
+                                                    }
                                                 }
                                             }
                                         }
@@ -1167,7 +1169,8 @@ fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, 
             c.update(UserId(src_id), *pos);
         }
         AnnotMsg::StrokeBegin { stroke_id, pos, width, color, alpha, .. } => {
-            draws.lock().unwrap().begin_stroke(UserId(src_id), *stroke_id, *pos, *width, color.clone(), *alpha);
+            let color = color.chars().take(7).collect::<String>();
+            draws.lock().unwrap().begin_stroke(UserId(src_id), *stroke_id, *pos, *width, color, *alpha);
         }
         AnnotMsg::StrokePoint { stroke_id, pos, .. } => {
             draws.lock().unwrap().add_point(UserId(src_id), *stroke_id, *pos);
