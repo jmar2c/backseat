@@ -6,6 +6,7 @@ mod capture;
 mod cursor;
 mod decoder;
 mod draw_layer;
+mod sticker_layer;
 mod encoder;
 mod renderer;
 mod transport;

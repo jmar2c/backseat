@@ -35,4 +35,10 @@ pub enum AnnotMsg {
     /// Asks the host to delete a specific stroke (used by the eraser tool).
     EraseStroke { stroke_id: Uuid },
     ClearAll,
+    /// Places a new sticker; the image bytes arrive separately via PKT_IMAGE_*.
+    StickerPlace  { sticker_id: u64, pos: NormPoint, size: NormPoint },
+    /// Updates position/size of an existing sticker (drag/resize).
+    StickerMove   { sticker_id: u64, pos: NormPoint, size: NormPoint },
+    /// Deletes a sticker and frees the viewer's sticker slot.
+    StickerRemove { sticker_id: u64 },
 }

@@ -23,13 +23,17 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use crc32fast;
 
-const PKT_PUNCH:      u8 = 0x01;
-const PKT_VIDEO:      u8 = 0x02;
-const PKT_ANNOT:      u8 = 0x03;
-const PKT_DISCONNECT: u8 = 0x04;
-const PKT_AUDIO:      u8 = 0x05;
-const PKT_SYNC:       u8 = 0x06;
+const PKT_PUNCH:          u8 = 0x01;
+const PKT_VIDEO:          u8 = 0x02;
+const PKT_ANNOT:          u8 = 0x03;
+const PKT_DISCONNECT:     u8 = 0x04;
+const PKT_AUDIO:          u8 = 0x05;
+const PKT_SYNC:           u8 = 0x06;
+const PKT_IMAGE_CHUNK:    u8 = 0x07;
+const PKT_IMAGE_MANIFEST: u8 = 0x08;
+const PKT_IMAGE_NACK:     u8 = 0x09;
 
 const RTP_PT_VP8:  u8 = 96;
 const RTP_PT_OPUS: u8 = 111;
@@ -68,6 +72,14 @@ pub enum Packet {
     Disconnect,
     Audio { seq: u16, rtp_ts: u32, data: Vec<u8> },
     Sync  { video_ts: u32, audio_ts: u32, ntp_ms: u64 },
+    // ── Sticker image transfer ──────────────────────────────────────────────
+    /// One fragment of a sticker image with a CRC32 for per-chunk integrity.
+    ImageChunk    { sticker_id: u64, total: u16, idx: u16, crc32: u32, data: Vec<u8> },
+    /// Declares the expected SHA-256 and initial placement for a sticker.
+    /// Layout: [0x08][id:8][total:2][pos_x:4][pos_y:4][w:4][h:4][sha256:32]
+    ImageManifest { sticker_id: u64, total_chunks: u16, pos_x: f32, pos_y: f32, size_w: f32, size_h: f32, sha256: [u8; 32] },
+    /// Host → viewer: list of chunk indices to retransmit.
+    ImageNack     { sticker_id: u64, missing: Vec<u16> },
 }
 
 fn gen_ssrc() -> u32 {
@@ -256,10 +268,95 @@ impl Transport {
                 Packet::Sync { video_ts, audio_ts, ntp_ms }
             }
 
+            // Layout: [0x07][id:8][total:2][idx:2][crc32:4][data…]  min = 17+1 = 18
+            PKT_IMAGE_CHUNK if data.len() >= 18 => {
+                let sticker_id = u64::from_be_bytes(data[1..9].try_into().ok()?);
+                let total      = u16::from_be_bytes([data[9],  data[10]]);
+                let idx        = u16::from_be_bytes([data[11], data[12]]);
+                let crc32      = u32::from_be_bytes([data[13], data[14], data[15], data[16]]);
+                Packet::ImageChunk { sticker_id, total, idx, crc32, data: data[17..].to_vec() }
+            }
+
+            // Layout: [0x08][id:8][total:2][pos_x:4][pos_y:4][w:4][h:4][sha256:32]  = 59
+            PKT_IMAGE_MANIFEST if data.len() == 59 => {
+                let sticker_id   = u64::from_be_bytes(data[1..9].try_into().ok()?);
+                let total_chunks = u16::from_be_bytes([data[9], data[10]]);
+                let pos_x  = f32::from_be_bytes(data[11..15].try_into().ok()?);
+                let pos_y  = f32::from_be_bytes(data[15..19].try_into().ok()?);
+                let size_w = f32::from_be_bytes(data[19..23].try_into().ok()?);
+                let size_h = f32::from_be_bytes(data[23..27].try_into().ok()?);
+                let mut sha256 = [0u8; 32];
+                sha256.copy_from_slice(&data[27..59]);
+                Packet::ImageManifest { sticker_id, total_chunks, pos_x, pos_y, size_w, size_h, sha256 }
+            }
+
+            // Layout: [0x09][id:8][count:2][idx:2 × count]  min = 11
+            PKT_IMAGE_NACK if data.len() >= 11 => {
+                let sticker_id = u64::from_be_bytes(data[1..9].try_into().ok()?);
+                let count      = u16::from_be_bytes([data[9], data[10]]) as usize;
+                if data.len() < 11 + count * 2 { return None; }
+                let missing = (0..count)
+                    .map(|i| u16::from_be_bytes([data[11 + i * 2], data[12 + i * 2]]))
+                    .collect();
+                Packet::ImageNack { sticker_id, missing }
+            }
+
             _ => return None,
         };
 
         Some((from, pkt))
+    }
+
+    /// Fragment image bytes into CHUNK-sized pieces and send each with a CRC32.
+    pub async fn send_image_chunks(
+        &self, to: SocketAddr, sticker_id: u64, bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let chunks: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
+        let total = chunks.len() as u16;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let crc = crc32fast::hash(chunk);
+            let mut pkt = Vec::with_capacity(17 + chunk.len());
+            pkt.push(PKT_IMAGE_CHUNK);
+            pkt.extend_from_slice(&sticker_id.to_be_bytes());
+            pkt.extend_from_slice(&total.to_be_bytes());
+            pkt.extend_from_slice(&(i as u16).to_be_bytes());
+            pkt.extend_from_slice(&crc.to_be_bytes());
+            pkt.extend_from_slice(chunk);
+            self.socket.send_to(&pkt, to).await?;
+        }
+        Ok(())
+    }
+
+    /// Send the manifest declaring a sticker's total chunk count, placement, and SHA-256.
+    pub async fn send_image_manifest(
+        &self, to: SocketAddr, sticker_id: u64, total_chunks: u16,
+        pos_x: f32, pos_y: f32, size_w: f32, size_h: f32, sha256: &[u8; 32],
+    ) -> std::io::Result<()> {
+        let mut pkt = [0u8; 59];
+        pkt[0] = PKT_IMAGE_MANIFEST;
+        pkt[1..9].copy_from_slice(&sticker_id.to_be_bytes());
+        pkt[9..11].copy_from_slice(&total_chunks.to_be_bytes());
+        pkt[11..15].copy_from_slice(&pos_x.to_be_bytes());
+        pkt[15..19].copy_from_slice(&pos_y.to_be_bytes());
+        pkt[19..23].copy_from_slice(&size_w.to_be_bytes());
+        pkt[23..27].copy_from_slice(&size_h.to_be_bytes());
+        pkt[27..59].copy_from_slice(sha256);
+        self.socket.send_to(&pkt, to).await.map(|_| ())
+    }
+
+    /// Send a NACK listing chunk indices that need retransmission.
+    pub async fn send_image_nack(
+        &self, to: SocketAddr, sticker_id: u64, missing: &[u16],
+    ) -> std::io::Result<()> {
+        let count = missing.len().min(1000) as u16;
+        let mut pkt = Vec::with_capacity(11 + count as usize * 2);
+        pkt.push(PKT_IMAGE_NACK);
+        pkt.extend_from_slice(&sticker_id.to_be_bytes());
+        pkt.extend_from_slice(&count.to_be_bytes());
+        for &idx in &missing[..count as usize] {
+            pkt.extend_from_slice(&idx.to_be_bytes());
+        }
+        self.socket.send_to(&pkt, to).await.map(|_| ())
     }
 }
 

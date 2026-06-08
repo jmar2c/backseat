@@ -9,6 +9,10 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::audio::{AudioCapture, AudioPlayer, AudioSource};
+use crate::sticker_layer::{
+    AssembleResult, HostSticker, HostStickerEntry, StickerReassembler,
+    ViewerSticker, ViewerStickerLayer, MAX_STICKERS_PER_VIEWER,
+};
 
 // cpal::Stream is !Send, so AudioCapture and AudioPlayer cannot be moved into
 // tokio tasks or Send types.  Since audio runs for the lifetime of the process
@@ -29,11 +33,14 @@ use crate::types::{AnnotMsg, NormPoint, UserColor, UserId, UserInfo};
 #[derive(Clone, Copy, PartialEq)]
 enum PenType { Pen, Marker }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ActiveTool { Draw, Eraser, Select }
+
 struct ToolState {
+    active:    ActiveTool,
     pen_type:  PenType,
     color_idx: usize,
     size:      f32,
-    eraser:    bool,
 }
 
 const MAX_PEERS: usize = 50;
@@ -51,7 +58,7 @@ const PALETTE: &[(&str, &str)] = &[
 
 impl Default for ToolState {
     fn default() -> Self {
-        Self { pen_type: PenType::Pen, color_idx: 4, size: 3.0, eraser: false }
+        Self { active: ActiveTool::Draw, pen_type: PenType::Pen, color_idx: 4, size: 3.0 }
     }
 }
 
@@ -93,6 +100,7 @@ struct HostReady {
     local_code:    String,
     annot_rx:      mpsc::Receiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
+    sticker_rx:    mpsc::UnboundedReceiver<(Uuid, u64, HostSticker)>,
     cursors:       Arc<Mutex<CursorState>>,
     draws:         Arc<Mutex<DrawLayer>>,
     capture_ok:    Arc<AtomicBool>,
@@ -105,6 +113,8 @@ struct HostCtx {
     _transport:    Arc<Transport>,
     annot_rx:      mpsc::Receiver<(Uuid, AnnotMsg)>,
     disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
+    sticker_rx:    mpsc::UnboundedReceiver<(Uuid, u64, HostSticker)>,
+    stickers:      std::collections::HashMap<u64, HostStickerEntry>,
     cursors:       Arc<Mutex<CursorState>>,
     draws:         Arc<Mutex<DrawLayer>>,
     tray:          crate::tray::HostTray,
@@ -116,24 +126,39 @@ struct JoinReady {
     transport:   Arc<Transport>,
     rgba_rx:     mpsc::UnboundedReceiver<RgbaFrame>,
     annot_out:   mpsc::UnboundedSender<String>,
+    image_out:   mpsc::UnboundedSender<(u64, Vec<u8>)>,
     viewer_id:   Uuid,
     host_addr:   SocketAddr,
     nat_warning: Option<String>,
 }
 
+/// Carries image bytes + sticker metadata from the async upload task back to the egui thread.
+struct UploadedImage {
+    sticker_id: u64,
+    bytes:      Vec<u8>,
+    pos:        crate::types::NormPoint,
+    size:       crate::types::NormPoint,
+}
+
 struct JoinCtx {
-    _transport:    Arc<Transport>,
-    rgba_rx:       mpsc::UnboundedReceiver<RgbaFrame>,
-    annot_out:     mpsc::UnboundedSender<String>,
-    cursors:       Arc<Mutex<CursorState>>,
-    draws:         Arc<Mutex<DrawLayer>>,
-    texture:       Option<egui::TextureHandle>,
-    viewer_id:     Uuid,
-    host_addr:     SocketAddr,
-    active_stroke: Option<Uuid>,
-    nat_warning:   Option<String>,
-    tool:          ToolState,
-    name:          String,
+    _transport:      Arc<Transport>,
+    rgba_rx:         mpsc::UnboundedReceiver<RgbaFrame>,
+    annot_out:       mpsc::UnboundedSender<String>,
+    image_out:       mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    cursors:         Arc<Mutex<CursorState>>,
+    draws:           Arc<Mutex<DrawLayer>>,
+    stickers:        ViewerStickerLayer,
+    sticker_textures: std::collections::HashMap<u64, egui::TextureHandle>,
+    selected_sticker:        Option<u64>,
+    sticker_dragging_resize: bool,
+    upload_rx:               Option<tokio::sync::oneshot::Receiver<Option<UploadedImage>>>,
+    texture:         Option<egui::TextureHandle>,
+    viewer_id:       Uuid,
+    host_addr:       SocketAddr,
+    active_stroke:   Option<Uuid>,
+    nat_warning:     Option<String>,
+    tool:            ToolState,
+    name:            String,
 }
 
 // ── State machine ─────────────────────────────────────────────────────────────
@@ -261,6 +286,8 @@ impl OverlayApp {
                             _transport:    ready.transport,
                             annot_rx:      ready.annot_rx,
                             disconnect_rx: ready.disconnect_rx,
+                            sticker_rx:    ready.sticker_rx,
+                            stickers:      std::collections::HashMap::new(),
                             cursors:       ready.cursors,
                             draws:         ready.draws,
                             tray,
@@ -275,7 +302,32 @@ impl OverlayApp {
             // ── Hosting ───────────────────────────────────────────────────────
             State::Hosting(mut h) => {
                 while let Ok((src_id, msg)) = h.annot_rx.try_recv() {
-                    apply_annot(src_id, &msg, &h.cursors, &h.draws);
+                    apply_annot(src_id, &msg, &h.cursors, &h.draws, &mut h.stickers, ctx);
+                }
+                while let Ok((owner, sticker_id, sticker)) = h.sticker_rx.try_recv() {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [1, 1], &[0, 0, 0, 0], // placeholder; real load below
+                    );
+                    // Load image bytes into an egui texture.
+                    if let Ok(dyn_img) = image::load_from_memory(&sticker.image_bytes) {
+                        let rgba = dyn_img.to_rgba8();
+                        let ci = egui::ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        );
+                        let tex = ctx.load_texture(
+                            format!("sticker-{sticker_id}"),
+                            ci,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        h.stickers.insert(sticker_id, HostStickerEntry {
+                            texture: tex,
+                            pos:     sticker.pos,
+                            size:    sticker.size,
+                            owner,
+                        });
+                    }
+                    drop(img); // suppress unused warning
                 }
                 if h.tray.pop_copy_request() {
                     ctx.output_mut(|o| o.copied_text = h.room_code.clone());
@@ -286,6 +338,7 @@ impl OverlayApp {
                 while let Ok(id) = h.disconnect_rx.try_recv() {
                     h.cursors.lock().unwrap().remove_user(&UserId(id));
                     h.draws.lock().unwrap().remove_user_strokes(id);
+                    h.stickers.retain(|_, s| s.owner != id);
                 }
 
                 egui::Window::new("backseat")
@@ -322,7 +375,9 @@ impl OverlayApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                        crate::renderer::paint(ui.painter(), ui.max_rect(), &h.draws, &h.cursors);
+                        let rect = ui.max_rect();
+                        crate::renderer::paint_stickers(ui.painter(), rect, &h.stickers);
+                        crate::renderer::paint(ui.painter(), rect, &h.draws, &h.cursors);
                     });
 
                 State::Hosting(h)
@@ -413,6 +468,44 @@ impl OverlayApp {
                     }
                 }
 
+                // ── Poll async upload result ──────────────────────────────────
+                if let Some(ref mut rx) = j.upload_rx {
+                    if let Ok(Some(uploaded)) = rx.try_recv() {
+                        j.upload_rx = None;
+                        // Load texture locally for optimistic rendering.
+                        if let Ok(dyn_img) = image::load_from_memory(&uploaded.bytes) {
+                            let rgba = dyn_img.to_rgba8();
+                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                [rgba.width() as usize, rgba.height() as usize],
+                                rgba.as_raw(),
+                            );
+                            let tex = ctx.load_texture(
+                                format!("sticker-local-{}", uploaded.sticker_id),
+                                ci,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            j.sticker_textures.insert(uploaded.sticker_id, tex);
+                        }
+                        j.stickers.add(ViewerSticker {
+                            sticker_id: uploaded.sticker_id,
+                            image_bytes: uploaded.bytes.clone(),
+                            pos:  uploaded.pos,
+                            size: uploaded.size,
+                        });
+                        // Send manifest+chunks to host.
+                        let _ = j.image_out.send((uploaded.sticker_id, uploaded.bytes));
+                        // Notify host of initial position via AnnotMsg.
+                        let msg = AnnotMsg::StickerPlace {
+                            sticker_id: uploaded.sticker_id,
+                            pos:  uploaded.pos,
+                            size: uploaded.size,
+                        };
+                        let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                    } else if let Ok(None) = rx.try_recv() {
+                        j.upload_rx = None; // user cancelled
+                    }
+                }
+
                 // ── Toolbar ───────────────────────────────────────────────────
                 egui::Window::new("toolbar")
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
@@ -422,19 +515,19 @@ impl OverlayApp {
                             ui.label(egui::RichText::new(&j.name).strong());
                             ui.separator();
 
-                            if ui.selectable_label(j.tool.pen_type == PenType::Pen && !j.tool.eraser, "✏ Pen").clicked() {
+                            if ui.selectable_label(j.tool.active == ActiveTool::Draw && j.tool.pen_type == PenType::Pen, "✏ Pen").clicked() {
+                                j.tool.active   = ActiveTool::Draw;
                                 j.tool.pen_type = PenType::Pen;
-                                j.tool.eraser   = false;
                             }
-                            if ui.selectable_label(j.tool.pen_type == PenType::Marker && !j.tool.eraser, "🖍 Marker").clicked() {
+                            if ui.selectable_label(j.tool.active == ActiveTool::Draw && j.tool.pen_type == PenType::Marker, "🖍 Marker").clicked() {
+                                j.tool.active   = ActiveTool::Draw;
                                 j.tool.pen_type = PenType::Marker;
-                                j.tool.eraser   = false;
                             }
                             ui.separator();
 
                             for (i, &(hex, label)) in PALETTE.iter().enumerate() {
                                 let color    = crate::renderer::hex_to_color32(hex);
-                                let selected = j.tool.color_idx == i && !j.tool.eraser;
+                                let selected = j.tool.color_idx == i && j.tool.active == ActiveTool::Draw;
                                 let stroke   = if selected {
                                     egui::Stroke::new(2.0, egui::Color32::WHITE)
                                 } else {
@@ -446,21 +539,43 @@ impl OverlayApp {
                                     .min_size(egui::vec2(22.0, 22.0));
                                 if ui.add(btn).on_hover_text(label).clicked() {
                                     j.tool.color_idx = i;
-                                    j.tool.eraser    = false;
+                                    j.tool.active    = ActiveTool::Draw;
                                 }
                             }
                             ui.separator();
 
                             for &(label, sz) in &[("S", 2.0f32), ("M", 4.0), ("L", 8.0)] {
-                                if ui.selectable_label(j.tool.size == sz && !j.tool.eraser, label).clicked() {
+                                if ui.selectable_label(j.tool.active == ActiveTool::Draw && j.tool.size == sz, label).clicked() {
                                     j.tool.size   = sz;
-                                    j.tool.eraser = false;
+                                    j.tool.active = ActiveTool::Draw;
                                 }
                             }
                             ui.separator();
 
-                            if ui.selectable_label(j.tool.eraser, "⌫ Eraser").clicked() {
-                                j.tool.eraser = !j.tool.eraser;
+                            if ui.selectable_label(j.tool.active == ActiveTool::Eraser, "⌫ Eraser").clicked() {
+                                j.tool.active = if j.tool.active == ActiveTool::Eraser {
+                                    ActiveTool::Draw
+                                } else {
+                                    ActiveTool::Eraser
+                                };
+                            }
+                            if ui.selectable_label(j.tool.active == ActiveTool::Select, "↖ Select").clicked() {
+                                j.tool.active = if j.tool.active == ActiveTool::Select {
+                                    ActiveTool::Draw
+                                } else {
+                                    ActiveTool::Select
+                                };
+                            }
+                            ui.separator();
+
+                            let can_upload = j.stickers.count() < MAX_STICKERS_PER_VIEWER && j.upload_rx.is_none();
+                            if ui.add_enabled(can_upload, egui::Button::new("🖼 Sticker")).clicked() {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                j.upload_rx = Some(rx);
+                                self.rt.spawn(async move {
+                                    let result = pick_and_process_image().await;
+                                    let _ = tx.send(result);
+                                });
                             }
 
                             if ui.button("🗑 Clear").clicked() {
@@ -476,7 +591,7 @@ impl OverlayApp {
                     .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
                         let rect     = ui.max_rect();
-                        let response = ui.allocate_rect(rect, egui::Sense::drag());
+                        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
                         let painter  = ui.painter();
                         let to_norm = |p: egui::Pos2| NormPoint {
                             x: ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0),
@@ -490,68 +605,179 @@ impl OverlayApp {
                             let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                         }
 
-                        if j.tool.eraser {
-                            if let Some(sid) = j.active_stroke.take() {
-                                j.draws.lock().unwrap().end_stroke(sid);
-                                let msg = AnnotMsg::StrokeEnd { stroke_id: sid };
-                                let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                            }
-                            if response.dragged() || response.drag_started() {
-                                if let Some(pos) = response.interact_pointer_pos() {
-                                    let norm = to_norm(pos);
-                                    const ERASE_R: f32 = 0.03;
-                                    let to_erase: Vec<Uuid> = {
-                                        let layer = j.draws.lock().unwrap();
-                                        layer.strokes.iter()
-                                            .filter_map(|(&id, s)| {
-                                                s.points.iter().any(|p| {
-                                                    let dx = p.x - norm.x;
-                                                    let dy = p.y - norm.y;
-                                                    dx * dx + dy * dy < ERASE_R * ERASE_R
-                                                }).then_some(id)
-                                            })
-                                            .collect()
-                                    };
-                                    for stroke_id in to_erase {
-                                        j.draws.lock().unwrap().remove_stroke(stroke_id);
-                                        let msg = AnnotMsg::EraseStroke { stroke_id };
-                                        let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                                    }
-                                }
-                            }
-                            if let Some(pos) = response.hover_pos() {
-                                const ERASE_R: f32 = 0.03;
-                                let r = ERASE_R * rect.width().min(rect.height());
-                                painter.circle_stroke(pos, r, egui::Stroke::new(2.0, egui::Color32::WHITE));
-                            }
-                        } else {
-                            if response.drag_started() {
-                                let sid = Uuid::new_v4();
-                                j.active_stroke = Some(sid);
-                                if let Some(pos) = response.interact_pointer_pos() {
-                                    let norm  = to_norm(pos);
-                                    let width = j.tool.stroke_width();
-                                    let color = j.tool.stroke_color().to_string();
-                                    let alpha = j.tool.stroke_alpha();
-                                    j.draws.lock().unwrap().begin_stroke(UserId(j.viewer_id), sid, norm, width, color.clone(), alpha);
-                                    let msg = AnnotMsg::StrokeBegin { stroke_id: sid, pos: norm, width, color, alpha };
-                                    let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                                }
-                            }
-                            if let Some(sid) = j.active_stroke {
-                                if response.dragged() {
-                                    if let Some(pos) = response.interact_pointer_pos() {
-                                        let norm = to_norm(pos);
-                                        j.draws.lock().unwrap().add_point(UserId(j.viewer_id), sid, norm);
-                                        let msg = AnnotMsg::StrokePoint { stroke_id: sid, pos: norm };
-                                        let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                                    }
-                                }
-                                if response.drag_stopped() {
+                        match j.tool.active {
+                            ActiveTool::Eraser => {
+                                if let Some(sid) = j.active_stroke.take() {
                                     j.draws.lock().unwrap().end_stroke(sid);
                                     let msg = AnnotMsg::StrokeEnd { stroke_id: sid };
                                     let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
-                                    j.active_stroke = None;
+                                }
+                                if response.dragged() || response.drag_started() {
+                                    if let Some(pos) = response.interact_pointer_pos() {
+                                        let norm = to_norm(pos);
+                                        const ERASE_R: f32 = 0.03;
+                                        let to_erase: Vec<Uuid> = {
+                                            let layer = j.draws.lock().unwrap();
+                                            layer.strokes.iter()
+                                                .filter_map(|(&id, s)| {
+                                                    s.points.iter().any(|p| {
+                                                        let dx = p.x - norm.x;
+                                                        let dy = p.y - norm.y;
+                                                        dx * dx + dy * dy < ERASE_R * ERASE_R
+                                                    }).then_some(id)
+                                                })
+                                                .collect()
+                                        };
+                                        for stroke_id in to_erase {
+                                            j.draws.lock().unwrap().remove_stroke(stroke_id);
+                                            let msg = AnnotMsg::EraseStroke { stroke_id };
+                                            let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                        }
+                                    }
+                                }
+                                if let Some(pos) = response.hover_pos() {
+                                    const ERASE_R: f32 = 0.03;
+                                    let r = ERASE_R * rect.width().min(rect.height());
+                                    painter.circle_stroke(pos, r, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                                }
+                            }
+
+                            ActiveTool::Select => {
+                                if let Some(sid) = j.active_stroke.take() {
+                                    j.draws.lock().unwrap().end_stroke(sid);
+                                    let msg = AnnotMsg::StrokeEnd { stroke_id: sid };
+                                    let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                }
+                                // Capture drag mode (move vs resize) once at drag start.
+                                if response.drag_started() {
+                                    if let Some(pos) = response.interact_pointer_pos() {
+                                        let norm = to_norm(pos);
+                                        j.sticker_dragging_resize = false;
+                                        // Check resize handle on the already-selected sticker FIRST —
+                                        // the handle extends outside sticker bounds so hit_test would miss it.
+                                        let started_resize = j.selected_sticker.and_then(|sel_id| {
+                                            j.stickers.stickers.iter().find(|s| s.sticker_id == sel_id)
+                                        }).map_or(false, |s| {
+                                            let corner = crate::types::NormPoint {
+                                                x: s.pos.x + s.size.x,
+                                                y: s.pos.y + s.size.y,
+                                            };
+                                            let dx = norm.x - corner.x;
+                                            let dy = norm.y - corner.y;
+                                            dx * dx + dy * dy < 0.025 * 0.025
+                                        });
+                                        if started_resize {
+                                            j.sticker_dragging_resize = true;
+                                        } else {
+                                            j.selected_sticker = j.stickers.hit_test(norm);
+                                        }
+                                    }
+                                }
+                                if response.dragged() {
+                                    if let Some(sel_id) = j.selected_sticker {
+                                        let delta = response.drag_delta();
+                                        let dnx = delta.x / rect.width();
+                                        let dny = delta.y / rect.height();
+                                        if let Some(s) = j.stickers.get_mut(sel_id) {
+                                            if j.sticker_dragging_resize {
+                                                s.size.x = (s.size.x + dnx).max(0.05);
+                                                s.size.y = (s.size.y + dny).max(0.05);
+                                            } else {
+                                                s.pos.x += dnx;
+                                                s.pos.y += dny;
+                                            }
+                                            let msg = AnnotMsg::StickerMove {
+                                                sticker_id: sel_id,
+                                                pos:  s.pos,
+                                                size: s.size,
+                                            };
+                                            let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                        }
+                                    }
+                                }
+                                // Check for X-button click on the selected sticker.
+                                if response.clicked() {
+                                    if let Some(sel_id) = j.selected_sticker {
+                                        if let Some(pos) = response.interact_pointer_pos() {
+                                            let norm = to_norm(pos);
+                                            if let Some(s) = j.stickers.stickers.iter().find(|s| s.sticker_id == sel_id) {
+                                                let x_norm = crate::types::NormPoint {
+                                                    x: s.pos.x + s.size.x,
+                                                    y: s.pos.y,
+                                                };
+                                                let dx = norm.x - x_norm.x;
+                                                let dy = norm.y - x_norm.y;
+                                                if dx * dx + dy * dy < 0.018 * 0.018 {
+                                                    let msg = AnnotMsg::StickerRemove { sticker_id: sel_id };
+                                                    let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                                    j.stickers.remove(sel_id);
+                                                    j.sticker_textures.remove(&sel_id);
+                                                    j.selected_sticker = None;
+                                                } else {
+                                                    j.selected_sticker = j.stickers.hit_test(norm);
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(pos) = response.interact_pointer_pos() {
+                                        let norm = to_norm(pos);
+                                        j.selected_sticker = j.stickers.hit_test(norm);
+                                    }
+                                }
+
+                                // Cursor and hover state for handle proximity.
+                                if let Some(hover_pos) = response.hover_pos() {
+                                    let hn = to_norm(hover_pos);
+                                    if let Some(sel_id) = j.selected_sticker {
+                                        if let Some(s) = j.stickers.stickers.iter().find(|s| s.sticker_id == sel_id) {
+                                            let corner = crate::types::NormPoint {
+                                                x: s.pos.x + s.size.x, y: s.pos.y + s.size.y,
+                                            };
+                                            let cdx = hn.x - corner.x;
+                                            let cdy = hn.y - corner.y;
+                                            let x_pt = crate::types::NormPoint {
+                                                x: s.pos.x + s.size.x, y: s.pos.y,
+                                            };
+                                            let xdx = hn.x - x_pt.x;
+                                            let xdy = hn.y - x_pt.y;
+                                            if cdx * cdx + cdy * cdy < 0.025 * 0.025 {
+                                                ctx.set_cursor_icon(egui::CursorIcon::ResizeSouthEast);
+                                            } else if xdx * xdx + xdy * xdy < 0.018 * 0.018 {
+                                                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            ActiveTool::Draw => {
+                                if response.drag_started() {
+                                    let sid = Uuid::new_v4();
+                                    j.active_stroke = Some(sid);
+                                    if let Some(pos) = response.interact_pointer_pos() {
+                                        let norm  = to_norm(pos);
+                                        let width = j.tool.stroke_width();
+                                        let color = j.tool.stroke_color().to_string();
+                                        let alpha = j.tool.stroke_alpha();
+                                        j.draws.lock().unwrap().begin_stroke(UserId(j.viewer_id), sid, norm, width, color.clone(), alpha);
+                                        let msg = AnnotMsg::StrokeBegin { stroke_id: sid, pos: norm, width, color, alpha };
+                                        let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                    }
+                                }
+                                if let Some(sid) = j.active_stroke {
+                                    if response.dragged() {
+                                        if let Some(pos) = response.interact_pointer_pos() {
+                                            let norm = to_norm(pos);
+                                            j.draws.lock().unwrap().add_point(UserId(j.viewer_id), sid, norm);
+                                            let msg = AnnotMsg::StrokePoint { stroke_id: sid, pos: norm };
+                                            let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                        }
+                                    }
+                                    if response.drag_stopped() {
+                                        j.draws.lock().unwrap().end_stroke(sid);
+                                        let msg = AnnotMsg::StrokeEnd { stroke_id: sid };
+                                        let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
+                                        j.active_stroke = None;
+                                    }
                                 }
                             }
                         }
@@ -564,6 +790,14 @@ impl OverlayApp {
                                 egui::Color32::WHITE,
                             );
                         }
+
+                        // Stickers always painted after the video frame.
+                        // selected_sticker is only Some when Select tool is active.
+                        let hover_norm = response.hover_pos().map(|p| to_norm(p));
+                        crate::renderer::paint_viewer_stickers(
+                            painter, rect, &j.stickers, &j.sticker_textures,
+                            j.selected_sticker, hover_norm,
+                        );
 
                         crate::renderer::paint(painter, rect, &j.draws, &j.cursors);
                     });
@@ -632,6 +866,7 @@ impl OverlayApp {
             let capture_ok   = Arc::new(AtomicBool::new(true));
             let keyframe_req = Arc::new(AtomicBool::new(false));
             let (annot_tx, annot_rx)         = mpsc::channel::<(Uuid, AnnotMsg)>(1_024);
+            let (sticker_tx, sticker_rx)     = mpsc::unbounded_channel::<(Uuid, u64, HostSticker)>();
             let (frame_tx, _dummy)           = broadcast::channel::<Arc<EncodedFrame>>(4);
             let (peer_hint_tx, peer_hint_rx) = mpsc::unbounded_channel::<SocketAddr>();
 
@@ -737,14 +972,19 @@ impl OverlayApp {
                 let mut peer_hint_rx = peer_hint_rx;
                 let mut audio_rx  = audio_rx;
                 let keyframe_req  = Arc::clone(&keyframe_req);
+                let sticker_tx    = sticker_tx;
                 tokio::spawn(async move {
                     let mut peers:          HashMap<SocketAddr, PeerInfo> = HashMap::new();
                     let mut buf                                             = vec![0u8; 65_536];
                     let mut hint_done                                       = false;
                     let mut last_video_pts: u32                             = 0;
                     let mut last_audio_pts: u32                             = 0;
+                    let mut reassembler    = StickerReassembler::default();
+                    let mut sticker_counts: HashMap<Uuid, usize>           = HashMap::new();
                     let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
+                    let mut nack_tick = tokio::time::interval(Duration::from_secs(2));
                     sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    nack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                     loop {
                         tokio::select! {
@@ -802,7 +1042,31 @@ impl OverlayApp {
                                         Packet::Disconnect => {
                                             if let Some(info) = peers.remove(&src) {
                                                 tracing::info!("viewer {} disconnected cleanly", info.viewer_id);
+                                                sticker_counts.remove(&info.viewer_id);
                                                 let _ = disconnect_tx.send(info.viewer_id);
+                                            }
+                                        }
+                                        Packet::ImageChunk { sticker_id, total, idx, crc32, data } => {
+                                            if let Some(peer) = peers.get(&src) {
+                                                let viewer_id = peer.viewer_id;
+                                                let result = reassembler.push_chunk(sticker_id, total, idx, crc32, data);
+                                                handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts);
+                                            }
+                                        }
+                                        Packet::ImageManifest { sticker_id, total_chunks, pos_x, pos_y, size_w, size_h, sha256 } => {
+                                            if let Some(peer) = peers.get(&src) {
+                                                let viewer_id = peer.viewer_id;
+                                                let count = sticker_counts.get(&viewer_id).copied().unwrap_or(0);
+                                                if count >= MAX_STICKERS_PER_VIEWER {
+                                                    tracing::warn!("viewer {viewer_id} at sticker limit, dropping sticker {sticker_id}");
+                                                } else {
+                                                    let result = reassembler.push_manifest(
+                                                        sticker_id, total_chunks,
+                                                        pos_x, pos_y, size_w, size_h,
+                                                        sha256, viewer_id,
+                                                    );
+                                                    handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts);
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -859,6 +1123,18 @@ impl OverlayApp {
                                     }
                                 }
                             }
+
+                            _ = nack_tick.tick() => {
+                                for (sticker_id, missing) in reassembler.collect_nacks() {
+                                    // Find which peer owns this sticker and send them the NACK.
+                                    for (&addr, info) in &peers {
+                                        // We don't track sticker→peer mapping directly; broadcast to all peers.
+                                        // The viewer ignores NACKs for sticker_ids it didn't upload.
+                                        let _ = transport.send_image_nack(addr, sticker_id, &missing).await;
+                                        let _ = info.viewer_id; // silence unused warning
+                                    }
+                                }
+                            }
                         }
                     }
                 });
@@ -868,7 +1144,7 @@ impl OverlayApp {
             let live_code    = Arc::new(Mutex::new(room_code.clone()));
             let _ = tx.send(HostReady {
                 transport, room_code, local_code, annot_rx, disconnect_rx,
-                cursors, draws, capture_ok,
+                sticker_rx, cursors, draws, capture_ok,
                 live_code: Arc::clone(&live_code),
             });
 
@@ -983,6 +1259,8 @@ impl OverlayApp {
             let (frame_sync_tx, frame_sync_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
             let (rgba_tx, rgba_rx)             = mpsc::unbounded_channel::<RgbaFrame>();
             let (annot_out_tx, mut annot_out_rx) = mpsc::unbounded_channel::<String>();
+            // (sticker_id, encoded_image_bytes) — viewer queues uploads here
+            let (image_out_tx, mut image_out_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
             let viewer_id = Uuid::new_v4();
 
             // Audio player (best-effort — carry on without audio on failure).
@@ -1019,9 +1297,10 @@ impl OverlayApp {
             {
                 let transport = Arc::clone(&transport);
                 tokio::spawn(async move {
-                    let mut reassembler = Reassembler::new();
-                    let mut buf         = vec![0u8; 65_536];
-                    let mut actual_host: Option<std::net::SocketAddr> = None;
+                    let mut reassembler    = Reassembler::new();
+                    let mut buf            = vec![0u8; 65_536];
+                    let mut actual_host:   Option<std::net::SocketAddr> = None;
+                    let mut pending_images: HashMap<u64, Vec<u8>>       = HashMap::new();
                     let mut punch_ticker = tokio::time::interval(Duration::from_millis(500));
                     punch_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1076,6 +1355,27 @@ impl OverlayApp {
                                                 );
                                             }
                                         }
+                                        Packet::ImageNack { sticker_id, missing } => {
+                                            if from_host {
+                                                if let Some(bytes) = pending_images.get(&sticker_id) {
+                                                    let target = actual_host.unwrap_or(host_addr);
+                                                    let chunks: Vec<&[u8]> = bytes.chunks(1_200).collect();
+                                                    for idx in missing {
+                                                        if let Some(chunk) = chunks.get(idx as usize) {
+                                                            let crc = crc32fast::hash(chunk);
+                                                            let mut pkt = Vec::with_capacity(17 + chunk.len());
+                                                            pkt.push(0x07u8);
+                                                            pkt.extend_from_slice(&sticker_id.to_be_bytes());
+                                                            pkt.extend_from_slice(&(chunks.len() as u16).to_be_bytes());
+                                                            pkt.extend_from_slice(&idx.to_be_bytes());
+                                                            pkt.extend_from_slice(&crc.to_be_bytes());
+                                                            pkt.extend_from_slice(chunk);
+                                                            let _ = transport.socket.send_to(&pkt, target).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1085,13 +1385,33 @@ impl OverlayApp {
                                 let target = actual_host.unwrap_or(host_addr);
                                 let _ = transport.send_annot(target, &json).await;
                             }
+
+                            Some((sticker_id, bytes)) = image_out_rx.recv() => {
+                                let target = actual_host.unwrap_or(host_addr);
+                                // Store bytes for possible retransmit on NACK.
+                                pending_images.insert(sticker_id, bytes.clone());
+                                let chunks: Vec<&[u8]> = bytes.chunks(1_200).collect();
+                                let total = chunks.len() as u16;
+                                use sha2::{Sha256, Digest};
+                                let sha256: [u8; 32] = {
+                                    let mut h = Sha256::new(); h.update(&bytes); h.finalize().into()
+                                };
+                                // Initial placement: centre of screen, quarter width.
+                                let _ = transport.send_image_manifest(
+                                    target, sticker_id, total,
+                                    0.375, 0.375, 0.25, 0.25, &sha256,
+                                ).await;
+                                let _ = transport.send_image_chunks(target, sticker_id, &bytes).await;
+                            }
                         }
                     }
                 });
             }
 
             let _ = tx.send(JoinReady {
-                transport, rgba_rx, annot_out: annot_out_tx,
+                transport, rgba_rx,
+                annot_out: annot_out_tx,
+                image_out: image_out_tx,
                 viewer_id, host_addr, nat_warning,
             });
         });
@@ -1121,25 +1441,60 @@ impl OverlayApp {
         });
 
         State::Joining(JoinCtx {
-            _transport:    ready.transport,
-            rgba_rx:       ready.rgba_rx,
-            annot_out:     ready.annot_out,
+            _transport:       ready.transport,
+            rgba_rx:          ready.rgba_rx,
+            annot_out:        ready.annot_out,
+            image_out:        ready.image_out,
             cursors,
             draws,
-            texture:       None,
-            viewer_id:     ready.viewer_id,
-            host_addr:     ready.host_addr,
-            active_stroke: None,
-            nat_warning:   ready.nat_warning,
-            tool:          ToolState::default(),
-            name:          display_name,
+            stickers:                ViewerStickerLayer::default(),
+            sticker_textures:        std::collections::HashMap::new(),
+            selected_sticker:        None,
+            sticker_dragging_resize: false,
+            upload_rx:               None,
+            texture:          None,
+            viewer_id:        ready.viewer_id,
+            host_addr:        ready.host_addr,
+            active_stroke:    None,
+            nat_warning:      ready.nat_warning,
+            tool:             ToolState::default(),
+            name:             display_name,
         })
+    }
+}
+
+// ── Sticker assembly helper (called from transport task) ──────────────────────
+
+fn handle_assemble(
+    result: AssembleResult,
+    sticker_id: u64,
+    viewer_id: Uuid,
+    sticker_tx: &mpsc::UnboundedSender<(Uuid, u64, HostSticker)>,
+    sticker_counts: &mut HashMap<Uuid, usize>,
+) {
+    match result {
+        AssembleResult::Complete(sticker) => {
+            *sticker_counts.entry(viewer_id).or_insert(0) += 1;
+            let _ = sticker_tx.send((viewer_id, sticker_id, sticker));
+        }
+        AssembleResult::Corrupt => {
+            tracing::warn!("sticker {sticker_id} from {viewer_id} corrupt after assembly");
+        }
+        AssembleResult::Rejected => {
+            tracing::warn!("sticker {sticker_id} from {viewer_id} rejected");
+        }
+        AssembleResult::Pending => {}
     }
 }
 
 // ── Annotation application (host side) ───────────────────────────────────────
 
-fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
+fn apply_annot(
+    src_id: Uuid, msg: &AnnotMsg,
+    cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>,
+    stickers: &mut std::collections::HashMap<u64, HostStickerEntry>,
+    _ctx: &egui::Context,
+) {
     match msg {
         AnnotMsg::Register { name } => {
             let name = name.chars().take(64).collect::<String>();
@@ -1186,6 +1541,27 @@ fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, 
         AnnotMsg::ClearAll => {
             draws.lock().unwrap().remove_user_strokes(src_id);
         }
+        AnnotMsg::StickerPlace { sticker_id, pos, size } => {
+            if let Some(entry) = stickers.get_mut(sticker_id) {
+                if entry.owner == src_id {
+                    entry.pos  = *pos;
+                    entry.size = *size;
+                }
+            }
+        }
+        AnnotMsg::StickerMove { sticker_id, pos, size } => {
+            if let Some(entry) = stickers.get_mut(sticker_id) {
+                if entry.owner == src_id {
+                    entry.pos  = *pos;
+                    entry.size = *size;
+                }
+            }
+        }
+        AnnotMsg::StickerRemove { sticker_id } => {
+            if stickers.get(sticker_id).map_or(false, |e| e.owner == src_id) {
+                stickers.remove(sticker_id);
+            }
+        }
     }
 }
 
@@ -1196,6 +1572,55 @@ const SERVER_URL: &str = "https://backseat.fly.dev";
 fn server_url() -> Option<String> {
     let url = std::env::var("BACKSEAT_SERVER").unwrap_or_else(|_| SERVER_URL.to_string());
     if url.is_empty() { None } else { Some(url) }
+}
+
+/// Open a native file picker, decode the chosen image, resize to 960×540 ceiling,
+/// encode as PNG (has alpha) or JPEG (opaque), and return the upload payload.
+async fn pick_and_process_image() -> Option<UploadedImage> {
+    use image::imageops::FilterType;
+
+    let handle = rfd::AsyncFileDialog::new()
+        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+        .set_title("Choose a sticker image")
+        .pick_file()
+        .await?;
+
+    let raw = handle.read().await;
+    let mut img = image::load_from_memory(&raw).ok()?;
+
+    // Resize to fit within 960×540 if needed.
+    if img.width() > 960 || img.height() > 540 {
+        let scale = (960.0 / img.width() as f32).min(540.0 / img.height() as f32);
+        let nw = (img.width()  as f32 * scale) as u32;
+        let nh = (img.height() as f32 * scale) as u32;
+        img = img.resize(nw, nh, FilterType::Lanczos3);
+    }
+
+    let mut buf = Vec::new();
+    let has_alpha = img.color().has_alpha();
+    if has_alpha {
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
+    } else {
+        {
+            let mut cursor = std::io::Cursor::new(&mut buf);
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
+            enc.encode_image(&img).ok()?;
+        }
+    }
+
+    let sticker_id: u64 = rand_u64();
+    // Initial placement: centred, 25% of screen width.
+    let pos  = crate::types::NormPoint { x: 0.375, y: 0.375 };
+    let size = crate::types::NormPoint { x: 0.25,  y: 0.25  };
+    Some(UploadedImage { sticker_id, bytes: buf, pos, size })
+}
+
+fn rand_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    // XorShift-based one-shot to avoid pulling in a rand crate.
+    let mut x = t as u64 ^ 0xDEAD_BEEF_CAFE_1234;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17; x
 }
 
 /// Drive an optional audio receiver without spinning: returns `None` forever when absent.
