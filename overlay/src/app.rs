@@ -486,14 +486,14 @@ impl OverlayApp {
                         if let Some(pos) = response.hover_pos() {
                             let norm = to_norm(pos);
                             j.cursors.lock().unwrap().update(UserId(j.viewer_id), norm);
-                            let msg = AnnotMsg::CursorMove { viewer_id: j.viewer_id, pos: norm };
+                            let msg = AnnotMsg::CursorMove { pos: norm };
                             let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                         }
 
                         if j.tool.eraser {
                             if let Some(sid) = j.active_stroke.take() {
                                 j.draws.lock().unwrap().end_stroke(sid);
-                                let msg = AnnotMsg::StrokeEnd { viewer_id: j.viewer_id, stroke_id: sid };
+                                let msg = AnnotMsg::StrokeEnd { stroke_id: sid };
                                 let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                             }
                             if response.dragged() || response.drag_started() {
@@ -514,7 +514,7 @@ impl OverlayApp {
                                     };
                                     for stroke_id in to_erase {
                                         j.draws.lock().unwrap().remove_stroke(stroke_id);
-                                        let msg = AnnotMsg::EraseStroke { viewer_id: j.viewer_id, stroke_id };
+                                        let msg = AnnotMsg::EraseStroke { stroke_id };
                                         let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                                     }
                                 }
@@ -534,7 +534,7 @@ impl OverlayApp {
                                     let color = j.tool.stroke_color().to_string();
                                     let alpha = j.tool.stroke_alpha();
                                     j.draws.lock().unwrap().begin_stroke(UserId(j.viewer_id), sid, norm, width, color.clone(), alpha);
-                                    let msg = AnnotMsg::StrokeBegin { viewer_id: j.viewer_id, stroke_id: sid, pos: norm, width, color, alpha };
+                                    let msg = AnnotMsg::StrokeBegin { stroke_id: sid, pos: norm, width, color, alpha };
                                     let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                                 }
                             }
@@ -543,13 +543,13 @@ impl OverlayApp {
                                     if let Some(pos) = response.interact_pointer_pos() {
                                         let norm = to_norm(pos);
                                         j.draws.lock().unwrap().add_point(UserId(j.viewer_id), sid, norm);
-                                        let msg = AnnotMsg::StrokePoint { viewer_id: j.viewer_id, stroke_id: sid, pos: norm };
+                                        let msg = AnnotMsg::StrokePoint { stroke_id: sid, pos: norm };
                                         let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                                     }
                                 }
                                 if response.drag_stopped() {
                                     j.draws.lock().unwrap().end_stroke(sid);
-                                    let msg = AnnotMsg::StrokeEnd { viewer_id: j.viewer_id, stroke_id: sid };
+                                    let msg = AnnotMsg::StrokeEnd { stroke_id: sid };
                                     let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                                     j.active_stroke = None;
                                 }
@@ -1109,7 +1109,7 @@ impl OverlayApp {
             name.trim().to_string()
         };
 
-        let register = AnnotMsg::Register { viewer_id: ready.viewer_id, name: display_name.clone() };
+        let register = AnnotMsg::Register { name: display_name.clone() };
         let _ = ready.annot_out.send(serde_json::to_string(&register).unwrap());
 
         let cursors = Arc::new(Mutex::new(CursorState::default()));
@@ -1141,7 +1141,7 @@ impl OverlayApp {
 
 fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>) {
     match msg {
-        AnnotMsg::Register { name, .. } => {
+        AnnotMsg::Register { name } => {
             let mut c = cursors.lock().unwrap();
             if let Some(user) = c.users.get_mut(&src_id) {
                 user.name = name.clone();
@@ -1155,7 +1155,7 @@ fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, 
                 });
             }
         }
-        AnnotMsg::CursorMove { pos, .. } => {
+        AnnotMsg::CursorMove { pos } => {
             let mut c = cursors.lock().unwrap();
             if !c.users.contains_key(&src_id) {
                 let palette = ["#e05c5c","#5c9ee0","#5ce07a","#e0c25c","#b05ce0","#5ce0d4"];
@@ -1168,18 +1168,18 @@ fn apply_annot(src_id: Uuid, msg: &AnnotMsg, cursors: &Arc<Mutex<CursorState>>, 
             }
             c.update(UserId(src_id), *pos);
         }
-        AnnotMsg::StrokeBegin { stroke_id, pos, width, color, alpha, .. } => {
+        AnnotMsg::StrokeBegin { stroke_id, pos, width, color, alpha } => {
             let color = color.chars().take(7).collect::<String>();
             draws.lock().unwrap().begin_stroke(UserId(src_id), *stroke_id, *pos, *width, color, *alpha);
         }
-        AnnotMsg::StrokePoint { stroke_id, pos, .. } => {
+        AnnotMsg::StrokePoint { stroke_id, pos } => {
             draws.lock().unwrap().add_point(UserId(src_id), *stroke_id, *pos);
         }
-        AnnotMsg::StrokeEnd { stroke_id, .. } => {
+        AnnotMsg::StrokeEnd { stroke_id } => {
             draws.lock().unwrap().end_stroke(*stroke_id);
         }
-        AnnotMsg::EraseStroke { stroke_id, .. } => {
-            draws.lock().unwrap().remove_stroke(*stroke_id);
+        AnnotMsg::EraseStroke { stroke_id } => {
+            draws.lock().unwrap().remove_stroke_if_owned(*stroke_id, src_id);
         }
         AnnotMsg::ClearAll => {
             draws.lock().unwrap().remove_user_strokes(src_id);

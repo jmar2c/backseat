@@ -73,6 +73,12 @@ impl DrawLayer {
         self.insertion_order.retain(|id| *id != stroke_id);
     }
 
+    pub fn remove_stroke_if_owned(&mut self, stroke_id: Uuid, user_id: Uuid) {
+        if self.strokes.get(&stroke_id).map_or(false, |s| s.user_id == user_id) {
+            self.remove_stroke(stroke_id);
+        }
+    }
+
     pub fn remove_user_strokes(&mut self, user_id: Uuid) {
         self.strokes.retain(|_, s| s.user_id != user_id);
         self.insertion_order.retain(|id| self.strokes.contains_key(id));

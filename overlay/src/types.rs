@@ -26,13 +26,13 @@ pub struct NormPoint { pub x: f32, pub y: f32 }
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnnotMsg {
     /// Sent once on connect so the host can display the viewer's chosen name.
-    Register    { viewer_id: Uuid, name: String },
-    CursorMove  { viewer_id: Uuid, pos: NormPoint },
+    Register    { name: String },
+    CursorMove  { pos: NormPoint },
     /// Begins a new stroke; carries the per-stroke style chosen by the viewer.
-    StrokeBegin { viewer_id: Uuid, stroke_id: Uuid, pos: NormPoint, width: f32, color: String, alpha: u8 },
-    StrokePoint { viewer_id: Uuid, stroke_id: Uuid, pos: NormPoint },
-    StrokeEnd   { viewer_id: Uuid, stroke_id: Uuid },
+    StrokeBegin { stroke_id: Uuid, pos: NormPoint, width: f32, color: String, alpha: u8 },
+    StrokePoint { stroke_id: Uuid, pos: NormPoint },
+    StrokeEnd   { stroke_id: Uuid },
     /// Asks the host to delete a specific stroke (used by the eraser tool).
-    EraseStroke { viewer_id: Uuid, stroke_id: Uuid },
+    EraseStroke { stroke_id: Uuid },
     ClearAll,
 }
