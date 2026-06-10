@@ -148,7 +148,7 @@ impl AudioCapture {
             .map_err(|e| format!("audio input stream: {e}"))?;
 
         stream.play().map_err(|e| format!("stream play: {e}"))?;
-        tracing::info!("audio capture started (mono {}Hz)", SAMPLE_RATE);
+        tracing::info!("audio capture started ({}ch {}Hz)", device_channels, config.sample_rate.0);
 
         Ok((Self { _stream: stream }, rx))
     }
@@ -209,13 +209,19 @@ fn native_capture_config(
     {
         use cpal::traits::DeviceTrait;
         if *source == AudioSource::Desktop {
-            let supported = device.default_output_config()
-                .map_err(|e| format!("could not query output device config: {e}"))?;
-            let channels = supported.channels() as usize;
-            tracing::info!("WASAPI loopback: {channels}ch {}Hz", supported.sample_rate().0);
+            // Keep the device's native channel count — WASAPI may reject a channel
+            // mismatch — but always request 48 kHz.  Opus only supports specific
+            // sample rates (8/12/16/24/48 kHz); 44.1 kHz, the most common Windows
+            // default, is not among them and causes OpusEncoder::new to return
+            // OPUS_BAD_ARG.  WASAPI shared-mode performs the SRC internally.
+            let channels = device
+                .default_output_config()
+                .map_err(|e| format!("could not query output device config: {e}"))?
+                .channels() as usize;
+            tracing::info!("WASAPI loopback: {channels}ch 48kHz");
             return Ok((cpal::StreamConfig {
                 channels:    channels as u16,
-                sample_rate: supported.sample_rate(),
+                sample_rate: cpal::SampleRate(SAMPLE_RATE),
                 buffer_size: cpal::BufferSize::Default,
             }, channels));
         }
@@ -247,8 +253,19 @@ impl AudioPlayer {
             .default_output_device()
             .ok_or_else(|| "no default output device".to_string())?;
 
+        // On Windows, some WASAPI devices reject a mono StreamConfig even in shared
+        // mode.  Use the device's native channel count and upmix the mono decoder
+        // output in the playback callback.
+        #[cfg(target_os = "windows")]
+        let out_channels = device
+            .default_output_config()
+            .map(|c| c.channels() as usize)
+            .unwrap_or(2);
+        #[cfg(not(target_os = "windows"))]
+        let out_channels: usize = 1;
+
         let config = cpal::StreamConfig {
-            channels:    1,
+            channels:    out_channels as u16,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Default,
         };
@@ -292,8 +309,12 @@ impl AudioPlayer {
                 &config,
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut b = pcm_out.lock().unwrap();
-                    for s in output.iter_mut() {
-                        *s = b.pop_front().unwrap_or(0.0);
+                    // Upmix mono decoder output to however many channels the device needs.
+                    for frame in output.chunks_mut(out_channels) {
+                        let sample = b.pop_front().unwrap_or(0.0);
+                        for s in frame {
+                            *s = sample;
+                        }
                     }
                 },
                 |err| tracing::warn!("audio output error: {err}"),
@@ -302,7 +323,7 @@ impl AudioPlayer {
             .map_err(|e| format!("audio output stream: {e}"))?;
 
         stream.play().map_err(|e| format!("stream play: {e}"))?;
-        tracing::info!("audio player started (mono {}Hz)", SAMPLE_RATE);
+        tracing::info!("audio player started ({}ch 48kHz)", out_channels);
 
         Ok((Self { _stream: stream, _dec_thread: dec_thread }, tx))
     }
