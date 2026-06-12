@@ -222,7 +222,7 @@ impl Transport {
         };
         let data = &buf[..n];
         if data.is_empty() { return None; }
-        tracing::debug!("udp rx {n}B from {from} type=0x{:02x}", data[0]);
+        tracing::trace!("udp rx {n}B from {from} type=0x{:02x}", data[0]);
 
         let pkt = match data[0] {
             PKT_PUNCH => Packet::Punch,

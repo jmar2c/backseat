@@ -999,7 +999,7 @@ impl OverlayApp {
                                     || keyframe_req.swap(false, Ordering::Relaxed);
                                 if let Some((data, pts)) = enc.encode(&bgra, keyframe) {
                                     if n == 0 { tracing::debug!("first encoded frame {} bytes", data.len()); }
-                                    if keyframe { tracing::debug!("encode keyframe {n} pts={pts} → {} bytes", data.len()); }
+                                    if keyframe { tracing::trace!("encode keyframe {n} pts={pts} → {} bytes", data.len()); }
                                     let _ = tx.send(Arc::new(EncodedFrame { data, pts, keyframe }));
                                 } else if keyframe {
                                     tracing::warn!("encode returned None at frame {n}");
@@ -1330,7 +1330,7 @@ impl OverlayApp {
 
             for i in 0..5 {
                 match transport.send_punch(host_addr).await {
-                    Ok(()) => tracing::debug!("punch {i} → {host_addr} ok"),
+                    Ok(()) => tracing::trace!("punch {i} → {host_addr} ok"),
                     Err(e) => tracing::warn!("punch {i} → {host_addr} failed: {e}"),
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1361,7 +1361,7 @@ impl OverlayApp {
                 tracing::debug!("decode thread started");
                 let mut decoded_count = 0u64;
                 while let Ok(data) = frame_sync_rx.recv() {
-                    tracing::debug!("decode thread got {} bytes", data.len());
+                    tracing::trace!("decode thread got {} bytes", data.len());
                     if let Some((w, h, pixels)) = dec.decode(&data) {
                         if decoded_count == 0 { tracing::debug!("first decoded frame {w}x{h}"); }
                         decoded_count += 1;
@@ -1388,7 +1388,7 @@ impl OverlayApp {
                         tokio::select! {
                             _ = punch_ticker.tick() => {
                                 match transport.send_punch(host_addr).await {
-                                    Ok(()) => tracing::debug!("periodic punch → {host_addr}"),
+                                    Ok(()) => tracing::trace!("periodic punch → {host_addr}"),
                                     Err(e) => tracing::warn!("periodic punch failed: {e}"),
                                 }
                             }
@@ -1414,9 +1414,9 @@ impl OverlayApp {
                                                     tracing::debug!("host video from {src} — locking as actual_host");
                                                     actual_host = Some(src);
                                                 }
-                                                tracing::debug!("rx frag rtp_ts={rtp_ts} {frag_idx}/{frag_total} kf={keyframe}");
+                                                tracing::trace!("rx frag rtp_ts={rtp_ts} {frag_idx}/{frag_total} kf={keyframe}");
                                                 if let Some((frame, _)) = reassembler.push(rtp_ts, frag_idx, frag_total, keyframe, data) {
-                                                    tracing::debug!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
+                                                    tracing::trace!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
                                                     let _ = frame_sync_tx.try_send(frame);
                                                 }
                                             }
@@ -1430,7 +1430,7 @@ impl OverlayApp {
                                         }
                                         Packet::Sync { video_ts, audio_ts, ntp_ms } => {
                                             if from_host {
-                                                tracing::debug!(
+                                                tracing::trace!(
                                                     "a/v sync anchor: video_ts={video_ts} audio_ts={audio_ts} ntp_ms={ntp_ms}"
                                                 );
                                             }
