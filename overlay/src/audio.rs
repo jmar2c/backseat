@@ -148,7 +148,7 @@ impl AudioCapture {
             .map_err(|e| format!("audio input stream: {e}"))?;
 
         stream.play().map_err(|e| format!("stream play: {e}"))?;
-        tracing::info!("audio capture started ({}ch {}Hz)", device_channels, config.sample_rate.0);
+        tracing::debug!("audio capture started ({}ch {}Hz)", device_channels, config.sample_rate.0);
 
         Ok((Self { _stream: stream }, rx))
     }
@@ -170,7 +170,7 @@ fn open_input_device(source: &AudioSource) -> Result<cpal::Device, String> {
                 // Requires: libasound2-plugins (provides the "pulse" ALSA device).
                 match pulse_monitor_source() {
                     Some(monitor_name) => {
-                        tracing::info!("audio: desktop capture via monitor source '{monitor_name}'");
+                        tracing::debug!("audio: desktop capture via monitor source '{monitor_name}'");
                         unsafe { std::env::set_var("PULSE_SOURCE", &monitor_name); }
                         host.default_input_device()
                             .ok_or_else(|| "no default input device".into())
@@ -183,7 +183,7 @@ fn open_input_device(source: &AudioSource) -> Result<cpal::Device, String> {
                 // WASAPI loopback: open the render (output) device as a loopback
                 // input. cpal's WASAPI backend uses AUDCLNT_STREAMFLAGS_LOOPBACK
                 // automatically when build_input_stream is called on a render device.
-                tracing::info!("audio: desktop capture via WASAPI loopback");
+                tracing::debug!("audio: desktop capture via WASAPI loopback");
                 host.default_output_device()
                     .ok_or_else(|| "no default output device for loopback".into())
             }
@@ -218,7 +218,7 @@ fn native_capture_config(
                 .default_output_config()
                 .map_err(|e| format!("could not query output device config: {e}"))?
                 .channels() as usize;
-            tracing::info!("WASAPI loopback: {channels}ch 48kHz");
+            tracing::debug!("WASAPI loopback: {channels}ch 48kHz");
             return Ok((cpal::StreamConfig {
                 channels:    channels as u16,
                 sample_rate: cpal::SampleRate(SAMPLE_RATE),
@@ -323,7 +323,7 @@ impl AudioPlayer {
             .map_err(|e| format!("audio output stream: {e}"))?;
 
         stream.play().map_err(|e| format!("stream play: {e}"))?;
-        tracing::info!("audio player started ({}ch 48kHz)", out_channels);
+        tracing::debug!("audio player started ({}ch 48kHz)", out_channels);
 
         Ok((Self { _stream: stream, _dec_thread: dec_thread }, tx))
     }

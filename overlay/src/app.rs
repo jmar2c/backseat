@@ -533,7 +533,7 @@ impl OverlayApp {
                     match &mut j.texture {
                         Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                         None    => {
-                            tracing::info!("first video texture {}x{}", frame.width, frame.height);
+                            tracing::debug!("first video texture {}x{}", frame.width, frame.height);
                             j.texture = Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
                         }
                     }
@@ -981,7 +981,7 @@ impl OverlayApp {
                         Ok(e)  => e,
                         Err(e) => { tracing::warn!("encoder init failed: {e}"); return; }
                     };
-                    tracing::info!("capture thread started {}x{}", cap.width, cap.height);
+                    tracing::debug!("capture thread started {}x{}", cap.width, cap.height);
                     let mut n             = 0u64;
                     let mut consec_errors = 0u32;
                     let mut enc_w         = cap.width;
@@ -998,7 +998,7 @@ impl OverlayApp {
                                 let keyframe = n % 150 == 0
                                     || keyframe_req.swap(false, Ordering::Relaxed);
                                 if let Some((data, pts)) = enc.encode(&bgra, keyframe) {
-                                    if n == 0 { tracing::info!("first encoded frame {} bytes", data.len()); }
+                                    if n == 0 { tracing::debug!("first encoded frame {} bytes", data.len()); }
                                     if keyframe { tracing::debug!("encode keyframe {n} pts={pts} → {} bytes", data.len()); }
                                     let _ = tx.send(Arc::new(EncodedFrame { data, pts, keyframe }));
                                 } else if keyframe {
@@ -1011,7 +1011,7 @@ impl OverlayApp {
                                 consec_errors += 1;
                                 if consec_errors == 1 { tracing::warn!("capture error: {e}"); }
                                 if consec_errors == 30 {
-                                    tracing::info!("reinitialising capturer after {consec_errors} errors");
+                                    tracing::debug!("reinitialising capturer after {consec_errors} errors");
                                     match ScreenCapture::new() {
                                         Ok(new_cap) => {
                                             let (nw, nh) = (new_cap.width, new_cap.height);
@@ -1072,7 +1072,7 @@ impl OverlayApp {
                                 match hint {
                                     None => hint_done = true,
                                     Some(addr) => {
-                                        tracing::info!("signaling: viewer STUN addr {addr}, punching");
+                                        tracing::debug!("signaling: viewer STUN addr {addr}, punching");
                                         let t = Arc::clone(&transport);
                                         tokio::spawn(async move {
                                             for _ in 0..10 {
@@ -1325,7 +1325,7 @@ impl OverlayApp {
                 }
             };
 
-            tracing::info!("viewer local={:?} STUN={my_stun:?} host={host_addr}",
+            tracing::debug!("viewer local={:?} STUN={my_stun:?} host={host_addr}",
                 transport.socket.local_addr());
 
             for i in 0..5 {
@@ -1358,19 +1358,19 @@ impl OverlayApp {
                     Ok(d)  => d,
                     Err(e) => { tracing::error!("decoder init: {e}"); return; }
                 };
-                tracing::info!("decode thread started");
+                tracing::debug!("decode thread started");
                 let mut decoded_count = 0u64;
                 while let Ok(data) = frame_sync_rx.recv() {
                     tracing::debug!("decode thread got {} bytes", data.len());
                     if let Some((w, h, pixels)) = dec.decode(&data) {
-                        if decoded_count == 0 { tracing::info!("first decoded frame {w}x{h}"); }
+                        if decoded_count == 0 { tracing::debug!("first decoded frame {w}x{h}"); }
                         decoded_count += 1;
                         let _ = rgba_tx.send(RgbaFrame { width: w, height: h, data: pixels });
                     } else {
                         tracing::warn!("decode returned None for {} bytes", data.len());
                     }
                 }
-                tracing::warn!("decode thread exiting");
+                tracing::debug!("decode thread exiting");
             });
 
             // Transport task.
@@ -1402,7 +1402,7 @@ impl OverlayApp {
                                     match pkt {
                                         Packet::Punch => {
                                             if actual_host.is_none() {
-                                                tracing::info!("punch-back from {src} — locking as actual_host");
+                                                tracing::debug!("punch-back from {src} — locking as actual_host");
                                                 actual_host = Some(src);
                                             }
                                         }
@@ -1411,7 +1411,7 @@ impl OverlayApp {
                                                 tracing::warn!("video from unexpected {src} (expected {host_addr} / {actual_host:?}) — dropping");
                                             } else {
                                                 if actual_host.is_none() {
-                                                    tracing::info!("host video from {src} — locking as actual_host");
+                                                    tracing::debug!("host video from {src} — locking as actual_host");
                                                     actual_host = Some(src);
                                                 }
                                                 tracing::debug!("rx frag rtp_ts={rtp_ts} {frag_idx}/{frag_total} kf={keyframe}");
@@ -1767,5 +1767,5 @@ fn x11_set_notification_type(window_id: u32) {
     }
 
     let _ = conn.flush();
-    tracing::info!("x11 overlay type: set _NET_WM_WINDOW_TYPE_NOTIFICATION on window {window_id}");
+    tracing::debug!("x11 overlay type: set _NET_WM_WINDOW_TYPE_NOTIFICATION on window {window_id}");
 }

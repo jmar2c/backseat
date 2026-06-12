@@ -13,6 +13,7 @@ tracing = { workspace = true }
 eframe = { version = "0.27", features = ["default_fonts"] }
 egui = "0.27"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 dotenvy = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 screenshots = "0.8"
