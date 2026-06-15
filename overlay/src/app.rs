@@ -170,6 +170,7 @@ enum State {
     ConfiguringHost {
         audio_source: AudioSource,
         has_monitor:  bool,
+        devices:      Vec<crate::audio::AudioDeviceInfo>,
     },
     Discovering  { rx: tokio::sync::oneshot::Receiver<HostReady> },
     Hosting      (HostCtx),
@@ -247,10 +248,11 @@ impl OverlayApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if clicked_host {
-                    let (has_monitor, _devices) = crate::audio::probe_devices();
+                    let (has_monitor, devices) = crate::audio::probe_devices();
                     return State::ConfiguringHost {
                         audio_source: AudioSource::None,
                         has_monitor,
+                        devices,
                     };
                 }
                 if clicked_join {
@@ -263,7 +265,7 @@ impl OverlayApp {
             }
 
             // ── Host settings ─────────────────────────────────────────────────
-            State::ConfiguringHost { mut audio_source, has_monitor } => {
+            State::ConfiguringHost { mut audio_source, has_monitor, devices } => {
                 let mut go_back  = false;
                 let mut go_start = false;
 
@@ -282,8 +284,38 @@ impl OverlayApp {
                     ui.separator();
                     ui.label(egui::RichText::new("Audio source").strong());
                     ui.add_space(4.0);
-                    ui.radio_value(&mut audio_source, AudioSource::None,       "None");
-                    ui.radio_value(&mut audio_source, AudioSource::Microphone, "Microphone");
+                    ui.radio_value(&mut audio_source, AudioSource::None, "None");
+
+                    // Microphone group: default mic radio + device picker combobox.
+                    let mic_active = matches!(audio_source, AudioSource::Microphone | AudioSource::NamedDevice(_));
+                    ui.horizontal(|ui| {
+                        if ui.radio(mic_active, "Microphone").clicked() {
+                            audio_source = AudioSource::Microphone;
+                        }
+                        ui.add_enabled_ui(mic_active, |ui| {
+                            let selected_label = match &audio_source {
+                                AudioSource::NamedDevice(n) => n.as_str(),
+                                _                           => "Default",
+                            };
+                            egui::ComboBox::from_id_source("mic_device")
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(
+                                        matches!(audio_source, AudioSource::Microphone),
+                                        "Default",
+                                    ).clicked() {
+                                        audio_source = AudioSource::Microphone;
+                                    }
+                                    for dev in devices.iter().filter(|d| !d.is_monitor) {
+                                        let sel = matches!(&audio_source, AudioSource::NamedDevice(n) if n == &dev.name);
+                                        if ui.selectable_label(sel, &dev.name).clicked() {
+                                            audio_source = AudioSource::NamedDevice(dev.name.clone());
+                                        }
+                                    }
+                                });
+                        });
+                    });
+
                     ui.add_enabled_ui(has_monitor, |ui| {
                         ui.radio_value(&mut audio_source, AudioSource::Desktop, "Desktop audio");
                     });
@@ -303,7 +335,7 @@ impl OverlayApp {
 
                 if go_back  { return State::ChoosingMode; }
                 if go_start { return self.begin_host(audio_source); }
-                State::ConfiguringHost { audio_source, has_monitor }
+                State::ConfiguringHost { audio_source, has_monitor, devices }
             }
 
             // ── Waiting for STUN ──────────────────────────────────────────────

@@ -25,6 +25,8 @@ pub enum AudioSource {
     None,
     /// Default system input device (usually the microphone).
     Microphone,
+    /// A specific input device selected by name.
+    NamedDevice(String),
     /// Desktop audio — uses the PulseAudio/PipeWire monitor source on Linux.
     /// Falls back to the default input device if no monitor is found.
     Desktop,
@@ -101,7 +103,7 @@ impl AudioCapture {
     ) -> Result<(Self, mpsc::UnboundedReceiver<(u32, Vec<u8>)>), String> {
         let app_type = match &source {
             AudioSource::Desktop => crate::opus::Application::Audio,
-            _                    => crate::opus::Application::Voip,
+            _                    => crate::opus::Application::Voip, // Microphone + NamedDevice
         };
         let device = open_input_device(&source)?;
 
@@ -162,6 +164,13 @@ fn open_input_device(source: &AudioSource) -> Result<cpal::Device, String> {
         AudioSource::Microphone => host
             .default_input_device()
             .ok_or_else(|| "no default input device".into()),
+        AudioSource::NamedDevice(name) => {
+            tracing::debug!("audio: named device capture via '{name}'");
+            host.input_devices()
+                .map_err(|e| format!("enumerate devices: {e}"))?
+                .find(|d| d.name().as_deref().ok() == Some(name.as_str()))
+                .ok_or_else(|| format!("audio device '{name}' not found"))
+        }
         AudioSource::Desktop => {
             #[cfg(target_os = "linux")]
             {
@@ -209,7 +218,7 @@ fn native_capture_config(
     #[cfg(target_os = "windows")]
     {
         use cpal::traits::DeviceTrait;
-        if *source == AudioSource::Desktop {
+        if *source == AudioSource::Desktop { // NamedDevice uses standard mono config below
             // Keep the device's native channel count — WASAPI may reject a channel
             // mismatch — but always request 48 kHz.  Opus only supports specific
             // sample rates (8/12/16/24/48 kHz); 44.1 kHz, the most common Windows
