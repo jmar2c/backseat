@@ -90,8 +90,9 @@ struct EncodedFrame {
 }
 
 struct PeerInfo {
-    last_seen: Instant,
-    viewer_id: Uuid,
+    last_seen:   Instant,
+    viewer_id:   Uuid,
+    last_kf_req: Instant,
 }
 
 struct HostReady {
@@ -1168,17 +1169,25 @@ impl OverlayApp {
                                             if is_new && peers.len() >= MAX_PEERS {
                                                 tracing::warn!("peer limit reached ({MAX_PEERS}), dropping punch from {src}");
                                             } else {
+                                                let long_ago = Instant::now() - Duration::from_secs(10);
                                                 let new_id = {
                                                     let entry = peers.entry(src).or_insert(PeerInfo {
-                                                        last_seen: Instant::now(),
-                                                        viewer_id: Uuid::new_v4(),
+                                                        last_seen:   Instant::now(),
+                                                        viewer_id:   Uuid::new_v4(),
+                                                        last_kf_req: long_ago,
                                                     });
                                                     entry.last_seen = Instant::now();
                                                     entry.viewer_id
                                                 };
                                                 if is_new {
                                                     tracing::info!("new peer {src} id={new_id} (total: {})", peers.len());
+                                                }
+                                                // Request a keyframe on the first punch and again
+                                                // every 3 s until the viewer has one to decode.
+                                                let peer = peers.get_mut(&src).unwrap();
+                                                if peer.last_kf_req.elapsed() >= Duration::from_secs(3) {
                                                     keyframe_req.store(true, Ordering::Relaxed);
+                                                    peer.last_kf_req = Instant::now();
                                                 }
                                                 let _ = transport.send_punch(src).await;
                                             }
