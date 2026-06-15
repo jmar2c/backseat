@@ -4,22 +4,24 @@ use std::mem::MaybeUninit;
 /// VP8 encoder wrapping the libvpx FFI.  Lives on its own OS thread because
 /// the libvpx context is not `Sync`.
 pub struct Vp8Encoder {
-    ctx:   vpx_codec_ctx_t,
-    image: *mut vpx_image_t,
-    /// Presentation timestamp in 90 kHz ticks (incremented by 3 000 per frame at 30 fps).
-    pts:   i64,
+    ctx:           vpx_codec_ctx_t,
+    cfg:           vpx_codec_enc_cfg_t,  // kept for live bitrate updates
+    image:         *mut vpx_image_t,
+    pts:           i64,
+    pts_per_frame: i64,
 }
 
 // SAFETY: only ever used from a single OS thread (the capture thread).
 unsafe impl Send for Vp8Encoder {}
 
 impl Vp8Encoder {
-    /// Initialise a CBR VP8 encoder for `width × height` frames at `bitrate_kbps`.
+    /// Initialise a CBR VP8 encoder for `width × height` frames.
     ///
+    /// `kf_frames` controls how often a forced keyframe is emitted (encoder units = frames).
     /// `g_error_resilient` is enabled so the decoder can recover if UDP packets are
     /// lost mid-stream without waiting for the next keyframe.
     /// `g_lag_in_frames = 0` disables lookahead, keeping encoding latency at one frame.
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
+    pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32, kf_frames: u64) -> Result<Self, String> {
         unsafe {
             let iface = vpx_codec_vp8_cx();
 
@@ -40,7 +42,7 @@ impl Vp8Encoder {
             cfg.g_lag_in_frames   = 0;        // real-time; no look-ahead delay
             cfg.rc_end_usage      = vpx_rc_mode_VPX_CBR;
             cfg.kf_mode           = vpx_kf_mode_VPX_KF_AUTO;
-            cfg.kf_max_dist       = 150;      // forced keyframe every ~5 s at 30 fps
+            cfg.kf_max_dist       = kf_frames as u32;
 
             let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
             let err = vpx_codec_enc_init_ver(
@@ -66,7 +68,22 @@ impl Vp8Encoder {
                 return Err("vpx_img_alloc returned null".into());
             }
 
-            Ok(Self { ctx, image, pts: 0 })
+            tracing::debug!("encoder init {width}x{height} {bitrate_kbps}kbps {fps}fps kf_every={kf_frames}");
+            let pts_per_frame = (90_000 / fps) as i64;
+            Ok(Self { ctx, cfg, image, pts: 0, pts_per_frame })
+        }
+    }
+
+    /// Update the encoder's target bitrate without restarting it.
+    pub fn set_bitrate(&mut self, kbps: u32) {
+        unsafe {
+            self.cfg.rc_target_bitrate = kbps;
+            let err = vpx_codec_enc_config_set(&mut self.ctx, &self.cfg);
+            if err != vpx_codec_err_t_VPX_CODEC_OK {
+                tracing::warn!("vpx_codec_enc_config_set: {err}");
+            } else {
+                tracing::debug!("encoder bitrate → {kbps} kbps");
+            }
         }
     }
 
@@ -89,7 +106,7 @@ impl Vp8Encoder {
                 flags,
                 VPX_DL_REALTIME as _,
             );
-            self.pts += 3_000; // 90_000 Hz / 30 fps
+            self.pts += self.pts_per_frame;
 
             if err != vpx_codec_err_t_VPX_CODEC_OK {
                 tracing::warn!("vpx_codec_encode: {err}");

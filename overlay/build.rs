@@ -45,6 +45,7 @@ fn main() {
     }
     vpx.allowlist_function("vpx_codec_vp8_cx")
         .allowlist_function("vpx_codec_enc_config_default")
+        .allowlist_function("vpx_codec_enc_config_set")
         .allowlist_function("vpx_codec_enc_init_ver")
         .allowlist_function("vpx_codec_encode")
         .allowlist_function("vpx_codec_get_cx_data")

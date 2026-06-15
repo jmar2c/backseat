@@ -8,6 +8,7 @@
 //! [0x04]                                                    PKT_DISCONNECT
 //! [0x05][RTP-12][opus-data…]                                PKT_AUDIO  (Opus frame)
 //! [0x06][video_ts:u32be][audio_ts:u32be][ntp_ms:u64be]      PKT_SYNC   (A/V clock anchor)
+//! [0x0C][loss_pct:f32be][ping_ms:f32be]                     PKT_STATS  (viewer → host, for ABR)
 //! ```
 //!
 //! Each RTP header is 12 bytes (RFC 3550):
@@ -36,6 +37,7 @@ const PKT_IMAGE_MANIFEST: u8 = 0x08;
 const PKT_IMAGE_NACK:     u8 = 0x09;
 const PKT_PING:           u8 = 0x0A;
 const PKT_PONG:           u8 = 0x0B;
+const PKT_STATS:          u8 = 0x0C;
 
 const RTP_PT_VP8:  u8 = 96;
 const RTP_PT_OPUS: u8 = 111;
@@ -86,6 +88,8 @@ pub enum Packet {
     Ping { sent_ms: u64 },
     /// Host → viewer: echo of the Ping timestamp for RTT calculation.
     Pong { sent_ms: u64 },
+    /// Viewer → host: network statistics used by the ABR loop.
+    Stats { loss_pct: f32, ping_ms: f32 },  // ping_ms reserved for future use
 }
 
 fn gen_ssrc() -> u32 {
@@ -320,6 +324,13 @@ impl Transport {
                 Packet::Pong { sent_ms }
             }
 
+            // Layout: [0x0C][loss_pct:4be][ping_ms:4be]
+            PKT_STATS if data.len() == 9 => {
+                let loss_pct = f32::from_be_bytes(data[1..5].try_into().ok()?);
+                let ping_ms  = f32::from_be_bytes(data[5..9].try_into().ok()?);
+                Packet::Stats { loss_pct, ping_ms }
+            }
+
             _ => return None,
         };
 
@@ -331,6 +342,15 @@ impl Transport {
         let mut pkt = [0u8; 9];
         pkt[0] = PKT_PING;
         pkt[1..9].copy_from_slice(&sent_ms.to_be_bytes());
+        self.socket.send_to(&pkt, to).await.map(|_| ())
+    }
+
+    /// Send viewer network statistics to the host for ABR bitrate adaptation.
+    pub async fn send_stats(&self, to: SocketAddr, loss_pct: f32, ping_ms: f32) -> std::io::Result<()> {
+        let mut pkt = [0u8; 9];
+        pkt[0] = PKT_STATS;
+        pkt[1..5].copy_from_slice(&loss_pct.to_be_bytes());
+        pkt[5..9].copy_from_slice(&ping_ms.to_be_bytes());
         self.socket.send_to(&pkt, to).await.map(|_| ())
     }
 

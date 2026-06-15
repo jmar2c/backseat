@@ -78,6 +78,20 @@ impl ToolState {
     }
 }
 
+// ── Quality / FPS settings ────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Default)]
+enum QualityPreset { Low, Medium, High, #[default] Auto }
+
+impl QualityPreset {
+    fn bitrate_kbps(self) -> u32 {
+        match self { Self::Low => 1_000, Self::Medium => 2_500, Self::High => 5_000, Self::Auto => 2_500 }
+    }
+    fn label(self) -> &'static str {
+        match self { Self::Low => "Low", Self::Medium => "Medium", Self::High => "High", Self::Auto => "Auto (ABR)" }
+    }
+}
+
 // ── Internal types ────────────────────────────────────────────────────────────
 
 struct RgbaFrame { width: u32, height: u32, data: Vec<u8> }
@@ -183,6 +197,8 @@ enum State {
         audio_source: AudioSource,
         has_monitor:  bool,
         devices:      Vec<crate::audio::AudioDeviceInfo>,
+        fps:          u32,
+        quality:      QualityPreset,
     },
     Discovering  { rx: tokio::sync::oneshot::Receiver<HostReady> },
     Hosting      (HostCtx),
@@ -265,6 +281,8 @@ impl OverlayApp {
                         audio_source: AudioSource::None,
                         has_monitor,
                         devices,
+                        fps:     30,
+                        quality: QualityPreset::Auto,
                     };
                 }
                 if clicked_join {
@@ -277,7 +295,7 @@ impl OverlayApp {
             }
 
             // ── Host settings ─────────────────────────────────────────────────
-            State::ConfiguringHost { mut audio_source, has_monitor, devices } => {
+            State::ConfiguringHost { mut audio_source, has_monitor, devices, mut fps, mut quality } => {
                 let mut go_back  = false;
                 let mut go_start = false;
 
@@ -339,6 +357,20 @@ impl OverlayApp {
                         );
                     }
                     ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Frame rate").strong());
+                    ui.horizontal(|ui| {
+                        for &(label, f) in &[("15 fps", 15u32), ("24 fps", 24), ("30 fps", 30), ("60 fps", 60)] {
+                            ui.radio_value(&mut fps, f, label);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Stream quality").strong());
+                    ui.horizontal(|ui| {
+                        for &q in &[QualityPreset::Low, QualityPreset::Medium, QualityPreset::High, QualityPreset::Auto] {
+                            ui.radio_value(&mut quality, q, q.label());
+                        }
+                    });
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         go_back  = ui.button("Back").clicked();
                         go_start = ui.button("Start Hosting").clicked();
@@ -346,8 +378,8 @@ impl OverlayApp {
                 });
 
                 if go_back  { return State::ChoosingMode; }
-                if go_start { return self.begin_host(audio_source); }
-                State::ConfiguringHost { audio_source, has_monitor, devices }
+                if go_start { return self.begin_host(audio_source, fps, quality); }
+                State::ConfiguringHost { audio_source, has_monitor, devices, fps, quality }
             }
 
             // ── Waiting for STUN ──────────────────────────────────────────────
@@ -965,7 +997,7 @@ impl OverlayApp {
 
     // ── Background task launchers ─────────────────────────────────────────────
 
-    fn begin_host(&mut self, audio_source: AudioSource) -> State {
+    fn begin_host(&mut self, audio_source: AudioSource, fps: u32, quality: QualityPreset) -> State {
         let (tx, rx) = tokio::sync::oneshot::channel::<HostReady>();
         self.rt.spawn(async move {
             let transport = match Transport::bind().await {
@@ -1021,6 +1053,17 @@ impl OverlayApp {
             let draws        = Arc::new(Mutex::new(DrawLayer::default()));
             let capture_ok   = Arc::new(AtomicBool::new(true));
             let keyframe_req = Arc::new(AtomicBool::new(false));
+            let viewer_loss  = Arc::new(Mutex::new(0.0f32));
+
+            let kf_secs = std::env::var("BACKSEAT_KF_SECS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(2.0)
+                .max(0.1);
+            let kf_frames       = (kf_secs * fps as f32).round() as u64;
+            let initial_bitrate = quality.bitrate_kbps();
+            let is_auto         = quality == QualityPreset::Auto;
+            tracing::debug!("stream config: {fps}fps kf_every={kf_frames} ({kf_secs:.1}s) {initial_bitrate}kbps auto={is_auto}");
             let (annot_tx, annot_rx)         = mpsc::channel::<(Uuid, AnnotMsg)>(1_024);
             let (sticker_tx, sticker_rx)     = mpsc::unbounded_channel::<(Uuid, u64, HostSticker)>();
             let (frame_tx, _dummy)           = broadcast::channel::<Arc<EncodedFrame>>(4);
@@ -1044,6 +1087,7 @@ impl OverlayApp {
                 let tx           = frame_tx.clone();
                 let capture_ok   = Arc::clone(&capture_ok);
                 let keyframe_req = Arc::clone(&keyframe_req);
+                let viewer_loss  = Arc::clone(&viewer_loss);
                 std::thread::spawn(move || {
                     let mut cap = match ScreenCapture::new() {
                         Ok(c)  => c,
@@ -1053,15 +1097,18 @@ impl OverlayApp {
                             return;
                         }
                     };
-                    let mut enc = match Vp8Encoder::new(cap.width as u32, cap.height as u32, 4_000) {
+                    let mut enc = match Vp8Encoder::new(cap.width as u32, cap.height as u32, initial_bitrate, fps, kf_frames) {
                         Ok(e)  => e,
                         Err(e) => { tracing::warn!("encoder init failed: {e}"); return; }
                     };
                     tracing::debug!("capture thread started {}x{}", cap.width, cap.height);
-                    let mut n             = 0u64;
-                    let mut consec_errors = 0u32;
-                    let mut enc_w         = cap.width;
-                    let mut enc_h         = cap.height;
+                    let mut n               = 0u64;
+                    let mut consec_errors   = 0u32;
+                    let mut enc_w           = cap.width;
+                    let mut enc_h           = cap.height;
+                    let mut current_bitrate = initial_bitrate;
+                    let mut last_abr        = Instant::now();
+                    let frame_dur           = Duration::from_nanos(1_000_000_000 / fps as u64);
                     loop {
                         let t = std::time::Instant::now();
                         match cap.capture() {
@@ -1071,7 +1118,7 @@ impl OverlayApp {
                                     capture_ok.store(true, Ordering::Relaxed);
                                     consec_errors = 0;
                                 }
-                                let keyframe = n % 150 == 0
+                                let keyframe = n % kf_frames == 0
                                     || keyframe_req.swap(false, Ordering::Relaxed);
                                 if let Some((data, pts)) = enc.encode(&bgra, keyframe) {
                                     if n == 0 { tracing::debug!("first encoded frame {} bytes", data.len()); }
@@ -1081,6 +1128,23 @@ impl OverlayApp {
                                     tracing::warn!("encode returned None at frame {n}");
                                 }
                                 n += 1;
+
+                                // ABR: adjust bitrate every 3 s based on viewer-reported loss.
+                                if is_auto && last_abr.elapsed() >= Duration::from_secs(3) {
+                                    let loss = *viewer_loss.lock().unwrap();
+                                    let new_bitrate = if loss > 5.0 {
+                                        (current_bitrate * 4 / 5).max(500)
+                                    } else if loss < 1.0 {
+                                        (current_bitrate * 11 / 10).min(8_000)
+                                    } else {
+                                        current_bitrate
+                                    };
+                                    if new_bitrate != current_bitrate {
+                                        enc.set_bitrate(new_bitrate);
+                                        current_bitrate = new_bitrate;
+                                    }
+                                    last_abr = Instant::now();
+                                }
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -1094,7 +1158,7 @@ impl OverlayApp {
                                             cap = new_cap;
                                             if nw != enc_w || nh != enc_h {
                                                 tracing::info!("resolution changed {enc_w}x{enc_h} → {nw}x{nh}, rebuilding encoder");
-                                                match Vp8Encoder::new(nw as u32, nh as u32, 4_000) {
+                                                match Vp8Encoder::new(nw as u32, nh as u32, current_bitrate, fps, kf_frames) {
                                                     Ok(new_enc) => { enc = new_enc; enc_w = nw; enc_h = nh; n = 0; }
                                                     Err(e) => tracing::warn!("encoder rebuild failed: {e}"),
                                                 }
@@ -1112,8 +1176,7 @@ impl OverlayApp {
                             }
                         }
                         let elapsed = t.elapsed();
-                        let target  = Duration::from_millis(33);
-                        if elapsed < target { std::thread::sleep(target - elapsed); }
+                        if elapsed < frame_dur { std::thread::sleep(frame_dur - elapsed); }
                     }
                 });
             }
@@ -1131,6 +1194,7 @@ impl OverlayApp {
                 let keyframe_req    = Arc::clone(&keyframe_req);
                 let sticker_tx      = sticker_tx;
                 let sticker_counts  = Arc::clone(&sticker_counts);
+                let viewer_loss     = Arc::clone(&viewer_loss);
                 tokio::spawn(async move {
                     let mut peers:          HashMap<SocketAddr, PeerInfo> = HashMap::new();
                     let mut buf                                             = vec![0u8; 65_536];
@@ -1238,6 +1302,12 @@ impl OverlayApp {
                                         Packet::Ping { sent_ms } => {
                                             if peers.contains_key(&src) {
                                                 let _ = transport.send_pong(src, sent_ms).await;
+                                            }
+                                        }
+                                        Packet::Stats { loss_pct, ping_ms: _ } => {
+                                            if peers.contains_key(&src) {
+                                                *viewer_loss.lock().unwrap() = loss_pct;
+                                                tracing::trace!("abr: viewer {src} loss={loss_pct:.1}%");
                                             }
                                         }
                                         _ => {}
@@ -1470,12 +1540,14 @@ impl OverlayApp {
                     let mut buf            = vec![0u8; 65_536];
                     let mut actual_host:   Option<std::net::SocketAddr> = None;
                     let mut pending_images: HashMap<u64, Vec<u8>>       = HashMap::new();
-                    let mut punch_ticker = tokio::time::interval(Duration::from_millis(500));
-                    let mut stats_tick   = tokio::time::interval(Duration::from_secs(1));
-                    let mut ping_tick    = tokio::time::interval(Duration::from_secs(2));
+                    let mut punch_ticker     = tokio::time::interval(Duration::from_millis(500));
+                    let mut stats_tick       = tokio::time::interval(Duration::from_secs(1));
+                    let mut ping_tick        = tokio::time::interval(Duration::from_secs(2));
+                    let mut stats_send_tick  = tokio::time::interval(Duration::from_secs(2));
                     punch_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    stats_send_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     let mut last_video_seq:   Option<u16>              = None;
                     let mut rx_bytes_window:  u64                      = 0;
                     let mut tx_bytes_window:  u64                      = 0;
@@ -1503,6 +1575,17 @@ impl OverlayApp {
                                 let _ = transport.send_ping(target, sent_ms).await;
                                 tx_bytes_window += 9;
                                 ping_sent_at = Some(std::time::Instant::now());
+                            }
+
+                            _ = stats_send_tick.tick() => {
+                                let target = actual_host.unwrap_or(host_addr);
+                                let (loss, ping) = if let Ok(s) = stats.lock() {
+                                    (s.loss_pct, s.ping_ms.unwrap_or(0.0))
+                                } else {
+                                    (0.0, 0.0)
+                                };
+                                let _ = transport.send_stats(target, loss, ping).await;
+                                tx_bytes_window += 9;
                             }
 
                             _ = stats_tick.tick() => {
