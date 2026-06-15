@@ -124,6 +124,14 @@ struct HostCtx {
     live_code:      Arc<Mutex<String>>,
 }
 
+#[derive(Default)]
+struct ConnectionStats {
+    rx_bps:   f32,
+    tx_bps:   f32,
+    loss_pct: f32,
+    ping_ms:  Option<f32>,
+}
+
 struct JoinReady {
     transport:   Arc<Transport>,
     rgba_rx:     mpsc::UnboundedReceiver<RgbaFrame>,
@@ -132,6 +140,7 @@ struct JoinReady {
     viewer_id:   Uuid,
     host_addr:   SocketAddr,
     nat_warning: Option<String>,
+    stats:       Arc<Mutex<ConnectionStats>>,
 }
 
 /// Carries image bytes + sticker metadata from the async upload task back to the egui thread.
@@ -161,6 +170,8 @@ struct JoinCtx {
     nat_warning:     Option<String>,
     tool:            ToolState,
     name:            String,
+    show_stats:      bool,
+    stats:           Arc<Mutex<ConnectionStats>>,
 }
 
 // ── State machine ─────────────────────────────────────────────────────────────
@@ -697,6 +708,11 @@ impl OverlayApp {
                                 let msg = AnnotMsg::ClearAll;
                                 let _ = j.annot_out.send(serde_json::to_string(&msg).unwrap());
                             }
+
+                            ui.separator();
+                            ui.menu_button("⚙", |ui| {
+                                ui.checkbox(&mut j.show_stats, "Show stats");
+                            });
                         });
                     });
 
@@ -914,6 +930,31 @@ impl OverlayApp {
                         );
 
                         crate::renderer::paint(painter, rect, &j.draws, &j.cursors);
+
+                        if j.show_stats {
+                            if let Ok(s) = j.stats.try_lock() {
+                                let ping_str = s.ping_ms
+                                    .map_or("—".to_string(), |p| format!("{:.0}ms", p));
+                                let line1 = format!(
+                                    "RX {:.2} MB/s   TX {:.2} MB/s",
+                                    s.rx_bps / 1_000_000.0,
+                                    s.tx_bps / 1_000_000.0,
+                                );
+                                let line2 = format!("Loss {:.1}%   Ping {}", s.loss_pct, ping_str);
+                                let font   = egui::FontId::monospace(12.0);
+                                let origin = rect.min + egui::vec2(8.0, 8.0);
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        origin - egui::vec2(4.0, 2.0),
+                                        egui::vec2(240.0, 38.0),
+                                    ),
+                                    4.0,
+                                    egui::Color32::from_black_alpha(160),
+                                );
+                                painter.text(origin,                          egui::Align2::LEFT_TOP, &line1, font.clone(), egui::Color32::WHITE);
+                                painter.text(origin + egui::vec2(0.0, 18.0), egui::Align2::LEFT_TOP, &line2, font,         egui::Color32::WHITE);
+                            }
+                        }
                     });
 
                 State::Joining(j)
@@ -1120,7 +1161,7 @@ impl OverlayApp {
                             }
 
                             res = transport.recv(&mut buf) => {
-                                if let Some((src, pkt)) = res {
+                                if let Some((src, pkt, _n)) = res {
                                     match pkt {
                                         Packet::Punch => {
                                             let is_new = !peers.contains_key(&src);
@@ -1183,6 +1224,11 @@ impl OverlayApp {
                                                     );
                                                     handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts.lock().unwrap());
                                                 }
+                                            }
+                                        }
+                                        Packet::Ping { sent_ms } => {
+                                            if peers.contains_key(&src) {
+                                                let _ = transport.send_pong(src, sent_ms).await;
                                             }
                                         }
                                         _ => {}
@@ -1406,15 +1452,27 @@ impl OverlayApp {
             });
 
             // Transport task.
+            let stats: Arc<Mutex<ConnectionStats>> = Arc::new(Mutex::new(ConnectionStats::default()));
             {
                 let transport = Arc::clone(&transport);
+                let stats     = Arc::clone(&stats);
                 tokio::spawn(async move {
                     let mut reassembler    = Reassembler::new();
                     let mut buf            = vec![0u8; 65_536];
                     let mut actual_host:   Option<std::net::SocketAddr> = None;
                     let mut pending_images: HashMap<u64, Vec<u8>>       = HashMap::new();
                     let mut punch_ticker = tokio::time::interval(Duration::from_millis(500));
+                    let mut stats_tick   = tokio::time::interval(Duration::from_secs(1));
+                    let mut ping_tick    = tokio::time::interval(Duration::from_secs(2));
                     punch_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut last_video_seq:   Option<u16>              = None;
+                    let mut rx_bytes_window:  u64                      = 0;
+                    let mut tx_bytes_window:  u64                      = 0;
+                    let mut rx_frags_window:  u64                      = 0;
+                    let mut lost_frags_window: u64                     = 0;
+                    let mut ping_sent_at: Option<std::time::Instant>   = None;
 
                     loop {
                         tokio::select! {
@@ -1423,10 +1481,40 @@ impl OverlayApp {
                                     Ok(()) => tracing::trace!("periodic punch → {host_addr}"),
                                     Err(e) => tracing::warn!("periodic punch failed: {e}"),
                                 }
+                                tx_bytes_window += 1;
+                            }
+
+                            _ = ping_tick.tick() => {
+                                let target = actual_host.unwrap_or(host_addr);
+                                let sent_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let _ = transport.send_ping(target, sent_ms).await;
+                                tx_bytes_window += 9;
+                                ping_sent_at = Some(std::time::Instant::now());
+                            }
+
+                            _ = stats_tick.tick() => {
+                                let total_frags = rx_frags_window + lost_frags_window;
+                                if let Ok(mut s) = stats.lock() {
+                                    s.rx_bps     = rx_bytes_window as f32;
+                                    s.tx_bps     = tx_bytes_window as f32;
+                                    s.loss_pct   = if total_frags > 0 {
+                                        lost_frags_window as f32 / total_frags as f32 * 100.0
+                                    } else {
+                                        0.0
+                                    };
+                                }
+                                rx_bytes_window   = 0;
+                                tx_bytes_window   = 0;
+                                rx_frags_window   = 0;
+                                lost_frags_window = 0;
                             }
 
                             res = transport.recv(&mut buf) => {
-                                if let Some((src, pkt)) = res {
+                                if let Some((src, pkt, n)) = res {
+                                    rx_bytes_window += n as u64;
                                     let from_host = match actual_host {
                                         Some(h) => src == h,
                                         None    => src == host_addr,
@@ -1438,7 +1526,7 @@ impl OverlayApp {
                                                 actual_host = Some(src);
                                             }
                                         }
-                                        Packet::VideoFrag { rtp_ts, frag_idx, frag_total, keyframe, data, .. } => {
+                                        Packet::VideoFrag { rtp_ts, seq, frag_idx, frag_total, keyframe, data } => {
                                             if !from_host {
                                                 tracing::warn!("video from unexpected {src} (expected {host_addr} / {actual_host:?}) — dropping");
                                             } else {
@@ -1446,6 +1534,12 @@ impl OverlayApp {
                                                     tracing::debug!("host video from {src} — locking as actual_host");
                                                     actual_host = Some(src);
                                                 }
+                                                if let Some(last) = last_video_seq {
+                                                    let gap = seq.wrapping_sub(last).saturating_sub(1);
+                                                    lost_frags_window += gap as u64;
+                                                    rx_frags_window   += 1 + gap as u64;
+                                                }
+                                                last_video_seq = Some(seq);
                                                 tracing::trace!("rx frag rtp_ts={rtp_ts} {frag_idx}/{frag_total} kf={keyframe}");
                                                 if let Some((frame, _)) = reassembler.push(rtp_ts, frag_idx, frag_total, keyframe, data) {
                                                     tracing::trace!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
@@ -1465,6 +1559,17 @@ impl OverlayApp {
                                                 tracing::trace!(
                                                     "a/v sync anchor: video_ts={video_ts} audio_ts={audio_ts} ntp_ms={ntp_ms}"
                                                 );
+                                            }
+                                        }
+                                        Packet::Pong { sent_ms } => {
+                                            if from_host {
+                                                if let Some(sent) = ping_sent_at.take() {
+                                                    let rtt_ms = sent.elapsed().as_secs_f32() * 1000.0;
+                                                    tracing::trace!("pong sent_ms={sent_ms} rtt={rtt_ms:.1}ms");
+                                                    if let Ok(mut s) = stats.lock() {
+                                                        s.ping_ms = Some(rtt_ms);
+                                                    }
+                                                }
                                             }
                                         }
                                         Packet::ImageNack { sticker_id, missing } => {
@@ -1495,6 +1600,7 @@ impl OverlayApp {
 
                             Some(json) = annot_out_rx.recv() => {
                                 let target = actual_host.unwrap_or(host_addr);
+                                tx_bytes_window += 1 + json.len() as u64;
                                 let _ = transport.send_annot(target, &json).await;
                             }
 
@@ -1508,6 +1614,8 @@ impl OverlayApp {
                                 let sha256: [u8; 32] = {
                                     let mut h = Sha256::new(); h.update(&bytes); h.finalize().into()
                                 };
+                                // 59 bytes for manifest + approx payload for chunks
+                                tx_bytes_window += 59 + bytes.len() as u64;
                                 // Initial placement: centre of screen, quarter width.
                                 let _ = transport.send_image_manifest(
                                     target, sticker_id, total,
@@ -1525,6 +1633,7 @@ impl OverlayApp {
                 annot_out: annot_out_tx,
                 image_out: image_out_tx,
                 viewer_id, host_addr, nat_warning,
+                stats,
             });
         });
         rx
@@ -1573,6 +1682,8 @@ impl OverlayApp {
             nat_warning:      ready.nat_warning,
             tool:             ToolState::default(),
             name:             display_name,
+            show_stats:       false,
+            stats:            ready.stats,
         })
     }
 }

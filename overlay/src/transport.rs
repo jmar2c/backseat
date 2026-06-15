@@ -34,6 +34,8 @@ const PKT_SYNC:           u8 = 0x06;
 const PKT_IMAGE_CHUNK:    u8 = 0x07;
 const PKT_IMAGE_MANIFEST: u8 = 0x08;
 const PKT_IMAGE_NACK:     u8 = 0x09;
+const PKT_PING:           u8 = 0x0A;
+const PKT_PONG:           u8 = 0x0B;
 
 const RTP_PT_VP8:  u8 = 96;
 const RTP_PT_OPUS: u8 = 111;
@@ -80,6 +82,10 @@ pub enum Packet {
     ImageManifest { sticker_id: u64, total_chunks: u16, pos_x: f32, pos_y: f32, size_w: f32, size_h: f32, sha256: [u8; 32] },
     /// Host → viewer: list of chunk indices to retransmit.
     ImageNack     { sticker_id: u64, missing: Vec<u16> },
+    /// Viewer → host: RTT probe with caller's timestamp (ms since UNIX epoch).
+    Ping { sent_ms: u64 },
+    /// Host → viewer: echo of the Ping timestamp for RTT calculation.
+    Pong { sent_ms: u64 },
 }
 
 fn gen_ssrc() -> u32 {
@@ -214,7 +220,8 @@ impl Transport {
     }
 
     /// Wait for the next incoming datagram and parse it into a [`Packet`].
-    pub async fn recv(&self, buf: &mut Vec<u8>) -> Option<(SocketAddr, Packet)> {
+    /// Returns `(src, packet, byte_count)` so callers can track bandwidth.
+    pub async fn recv(&self, buf: &mut Vec<u8>) -> Option<(SocketAddr, Packet, usize)> {
         buf.resize(65_536, 0);
         let (n, from) = match self.socket.recv_from(buf).await {
             Ok(v)  => v,
@@ -301,10 +308,38 @@ impl Transport {
                 Packet::ImageNack { sticker_id, missing }
             }
 
+            // Layout: [0x0A][sent_ms:8]
+            PKT_PING if data.len() == 9 => {
+                let sent_ms = u64::from_be_bytes(data[1..9].try_into().ok()?);
+                Packet::Ping { sent_ms }
+            }
+
+            // Layout: [0x0B][sent_ms:8]
+            PKT_PONG if data.len() == 9 => {
+                let sent_ms = u64::from_be_bytes(data[1..9].try_into().ok()?);
+                Packet::Pong { sent_ms }
+            }
+
             _ => return None,
         };
 
-        Some((from, pkt))
+        Some((from, pkt, n))
+    }
+
+    /// Send a round-trip probe to `to` with the caller's timestamp.
+    pub async fn send_ping(&self, to: SocketAddr, sent_ms: u64) -> std::io::Result<()> {
+        let mut pkt = [0u8; 9];
+        pkt[0] = PKT_PING;
+        pkt[1..9].copy_from_slice(&sent_ms.to_be_bytes());
+        self.socket.send_to(&pkt, to).await.map(|_| ())
+    }
+
+    /// Echo a Ping back as a Pong (host-side response).
+    pub async fn send_pong(&self, to: SocketAddr, sent_ms: u64) -> std::io::Result<()> {
+        let mut pkt = [0u8; 9];
+        pkt[0] = PKT_PONG;
+        pkt[1..9].copy_from_slice(&sent_ms.to_be_bytes());
+        self.socket.send_to(&pkt, to).await.map(|_| ())
     }
 
     /// Fragment image bytes into CHUNK-sized pieces and send each with a CRC32.
