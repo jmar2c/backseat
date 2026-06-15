@@ -95,31 +95,33 @@ struct PeerInfo {
 }
 
 struct HostReady {
-    transport:     Arc<Transport>,
-    room_code:     String,
-    local_code:    String,
-    annot_rx:      mpsc::Receiver<(Uuid, AnnotMsg)>,
-    disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
-    sticker_rx:    mpsc::UnboundedReceiver<(Uuid, u64, HostSticker)>,
-    cursors:       Arc<Mutex<CursorState>>,
-    draws:         Arc<Mutex<DrawLayer>>,
-    capture_ok:    Arc<AtomicBool>,
-    live_code:     Arc<Mutex<String>>,
+    transport:      Arc<Transport>,
+    room_code:      String,
+    local_code:     String,
+    annot_rx:       mpsc::Receiver<(Uuid, AnnotMsg)>,
+    disconnect_rx:  mpsc::UnboundedReceiver<Uuid>,
+    sticker_rx:     mpsc::UnboundedReceiver<(Uuid, u64, HostSticker)>,
+    sticker_counts: Arc<Mutex<HashMap<Uuid, usize>>>,
+    cursors:        Arc<Mutex<CursorState>>,
+    draws:          Arc<Mutex<DrawLayer>>,
+    capture_ok:     Arc<AtomicBool>,
+    live_code:      Arc<Mutex<String>>,
 }
 
 struct HostCtx {
-    room_code:     String,
-    local_code:    String,
-    _transport:    Arc<Transport>,
-    annot_rx:      mpsc::Receiver<(Uuid, AnnotMsg)>,
-    disconnect_rx: mpsc::UnboundedReceiver<Uuid>,
-    sticker_rx:    mpsc::UnboundedReceiver<(Uuid, u64, HostSticker)>,
-    stickers:      std::collections::HashMap<u64, HostStickerEntry>,
-    cursors:       Arc<Mutex<CursorState>>,
-    draws:         Arc<Mutex<DrawLayer>>,
-    tray:          crate::tray::HostTray,
-    capture_ok:    Arc<AtomicBool>,
-    live_code:     Arc<Mutex<String>>,
+    room_code:      String,
+    local_code:     String,
+    _transport:     Arc<Transport>,
+    annot_rx:       mpsc::Receiver<(Uuid, AnnotMsg)>,
+    disconnect_rx:  mpsc::UnboundedReceiver<Uuid>,
+    sticker_rx:     mpsc::UnboundedReceiver<(Uuid, u64, HostSticker)>,
+    stickers:       std::collections::HashMap<u64, HostStickerEntry>,
+    sticker_counts: Arc<Mutex<HashMap<Uuid, usize>>>,
+    cursors:        Arc<Mutex<CursorState>>,
+    draws:          Arc<Mutex<DrawLayer>>,
+    tray:           crate::tray::HostTray,
+    capture_ok:     Arc<AtomicBool>,
+    live_code:      Arc<Mutex<String>>,
 }
 
 struct JoinReady {
@@ -341,18 +343,19 @@ impl OverlayApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                         let tray = crate::tray::HostTray::new(ready.room_code.clone());
                         State::Hosting(HostCtx {
-                            room_code:     ready.room_code,
-                            local_code:    ready.local_code,
-                            _transport:    ready.transport,
-                            annot_rx:      ready.annot_rx,
-                            disconnect_rx: ready.disconnect_rx,
-                            sticker_rx:    ready.sticker_rx,
-                            stickers:      std::collections::HashMap::new(),
-                            cursors:       ready.cursors,
-                            draws:         ready.draws,
+                            room_code:      ready.room_code,
+                            local_code:     ready.local_code,
+                            _transport:     ready.transport,
+                            annot_rx:       ready.annot_rx,
+                            disconnect_rx:  ready.disconnect_rx,
+                            sticker_rx:     ready.sticker_rx,
+                            stickers:       std::collections::HashMap::new(),
+                            sticker_counts: ready.sticker_counts,
+                            cursors:        ready.cursors,
+                            draws:          ready.draws,
                             tray,
-                            capture_ok:    ready.capture_ok,
-                            live_code:     ready.live_code,
+                            capture_ok:     ready.capture_ok,
+                            live_code:      ready.live_code,
                         })
                     }
                     Err(_) => State::Discovering { rx },
@@ -362,7 +365,7 @@ impl OverlayApp {
             // ── Hosting ───────────────────────────────────────────────────────
             State::Hosting(mut h) => {
                 while let Ok((src_id, msg)) = h.annot_rx.try_recv() {
-                    apply_annot(src_id, &msg, &h.cursors, &h.draws, &mut h.stickers, ctx);
+                    apply_annot(src_id, &msg, &h.cursors, &h.draws, &mut h.stickers, &h.sticker_counts, ctx);
                 }
                 while let Ok((owner, sticker_id, sticker)) = h.sticker_rx.try_recv() {
                     let img = egui::ColorImage::from_rgba_unmultiplied(
@@ -1044,15 +1047,17 @@ impl OverlayApp {
 
             // Transport task: send encoded frames and audio to peers; receive annotations.
             let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<Uuid>();
+            let sticker_counts: Arc<Mutex<HashMap<Uuid, usize>>> = Arc::new(Mutex::new(HashMap::new()));
             {
-                let transport     = Arc::clone(&transport);
-                let annot_tx      = annot_tx;
-                let disconnect_tx = disconnect_tx;
-                let mut frame_rx  = frame_tx.subscribe();
+                let transport       = Arc::clone(&transport);
+                let annot_tx        = annot_tx;
+                let disconnect_tx   = disconnect_tx;
+                let mut frame_rx    = frame_tx.subscribe();
                 let mut peer_hint_rx = peer_hint_rx;
-                let mut audio_rx  = audio_rx;
-                let keyframe_req  = Arc::clone(&keyframe_req);
-                let sticker_tx    = sticker_tx;
+                let mut audio_rx    = audio_rx;
+                let keyframe_req    = Arc::clone(&keyframe_req);
+                let sticker_tx      = sticker_tx;
+                let sticker_counts  = Arc::clone(&sticker_counts);
                 tokio::spawn(async move {
                     let mut peers:          HashMap<SocketAddr, PeerInfo> = HashMap::new();
                     let mut buf                                             = vec![0u8; 65_536];
@@ -1060,7 +1065,6 @@ impl OverlayApp {
                     let mut last_video_pts: u32                             = 0;
                     let mut last_audio_pts: u32                             = 0;
                     let mut reassembler    = StickerReassembler::default();
-                    let mut sticker_counts: HashMap<Uuid, usize>           = HashMap::new();
                     let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
                     let mut nack_tick = tokio::time::interval(Duration::from_secs(2));
                     sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1122,7 +1126,7 @@ impl OverlayApp {
                                         Packet::Disconnect => {
                                             if let Some(info) = peers.remove(&src) {
                                                 tracing::info!("viewer {} disconnected cleanly", info.viewer_id);
-                                                sticker_counts.remove(&info.viewer_id);
+                                                sticker_counts.lock().unwrap().remove(&info.viewer_id);
                                                 let _ = disconnect_tx.send(info.viewer_id);
                                             }
                                         }
@@ -1130,13 +1134,13 @@ impl OverlayApp {
                                             if let Some(peer) = peers.get(&src) {
                                                 let viewer_id = peer.viewer_id;
                                                 let result = reassembler.push_chunk(sticker_id, total, idx, crc32, data);
-                                                handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts);
+                                                handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts.lock().unwrap());
                                             }
                                         }
                                         Packet::ImageManifest { sticker_id, total_chunks, pos_x, pos_y, size_w, size_h, sha256 } => {
                                             if let Some(peer) = peers.get(&src) {
                                                 let viewer_id = peer.viewer_id;
-                                                let count = sticker_counts.get(&viewer_id).copied().unwrap_or(0);
+                                                let count = sticker_counts.lock().unwrap().get(&viewer_id).copied().unwrap_or(0);
                                                 if count >= MAX_STICKERS_PER_VIEWER {
                                                     tracing::warn!("viewer {viewer_id} at sticker limit, dropping sticker {sticker_id}");
                                                 } else {
@@ -1145,7 +1149,7 @@ impl OverlayApp {
                                                         pos_x, pos_y, size_w, size_h,
                                                         sha256, viewer_id,
                                                     );
-                                                    handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts);
+                                                    handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts.lock().unwrap());
                                                 }
                                             }
                                         }
@@ -1224,7 +1228,7 @@ impl OverlayApp {
             let live_code    = Arc::new(Mutex::new(room_code.clone()));
             let _ = tx.send(HostReady {
                 transport, room_code, local_code, annot_rx, disconnect_rx,
-                sticker_rx, cursors, draws, capture_ok,
+                sticker_rx, sticker_counts, cursors, draws, capture_ok,
                 live_code: Arc::clone(&live_code),
             });
 
@@ -1575,6 +1579,7 @@ fn apply_annot(
     src_id: Uuid, msg: &AnnotMsg,
     cursors: &Arc<Mutex<CursorState>>, draws: &Arc<Mutex<DrawLayer>>,
     stickers: &mut std::collections::HashMap<u64, HostStickerEntry>,
+    sticker_counts: &Arc<Mutex<HashMap<Uuid, usize>>>,
     _ctx: &egui::Context,
 ) {
     match msg {
@@ -1642,6 +1647,9 @@ fn apply_annot(
         AnnotMsg::StickerRemove { sticker_id } => {
             if stickers.get(sticker_id).map_or(false, |e| e.owner == src_id) {
                 stickers.remove(sticker_id);
+                let mut counts = sticker_counts.lock().unwrap();
+                let n = counts.entry(src_id).or_insert(0);
+                *n = n.saturating_sub(1);
             }
         }
     }
