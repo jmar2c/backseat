@@ -1473,6 +1473,7 @@ impl OverlayApp {
                     let mut rx_frags_window:  u64                      = 0;
                     let mut lost_frags_window: u64                     = 0;
                     let mut ping_sent_at: Option<std::time::Instant>   = None;
+                    let mut got_keyframe = false;
 
                     loop {
                         tokio::select! {
@@ -1541,9 +1542,14 @@ impl OverlayApp {
                                                 }
                                                 last_video_seq = Some(seq);
                                                 tracing::trace!("rx frag rtp_ts={rtp_ts} {frag_idx}/{frag_total} kf={keyframe}");
-                                                if let Some((frame, _)) = reassembler.push(rtp_ts, frag_idx, frag_total, keyframe, data) {
-                                                    tracing::trace!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
-                                                    let _ = frame_sync_tx.try_send(frame);
+                                                if let Some((frame, is_kf)) = reassembler.push(rtp_ts, frag_idx, frag_total, keyframe, data) {
+                                                    if is_kf { got_keyframe = true; }
+                                                    if got_keyframe {
+                                                        tracing::trace!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
+                                                        let _ = frame_sync_tx.try_send(frame);
+                                                    } else {
+                                                        tracing::debug!("dropping P-frame rtp_ts={rtp_ts} before first keyframe");
+                                                    }
                                                 }
                                             }
                                         }
