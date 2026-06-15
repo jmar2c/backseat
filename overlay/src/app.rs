@@ -247,7 +247,7 @@ impl OverlayApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if clicked_host {
-                    let (has_monitor, _) = crate::audio::probe_devices();
+                    let (has_monitor, _devices) = crate::audio::probe_devices();
                     return State::ConfiguringHost {
                         audio_source: AudioSource::None,
                         has_monitor,
@@ -571,7 +571,6 @@ impl OverlayApp {
                         }
                         j.stickers.add(ViewerSticker {
                             sticker_id: uploaded.sticker_id,
-                            image_bytes: uploaded.bytes.clone(),
                             pos:  uploaded.pos,
                             size: uploaded.size,
                         });
@@ -1127,6 +1126,7 @@ impl OverlayApp {
                                             if let Some(info) = peers.remove(&src) {
                                                 tracing::info!("viewer {} disconnected cleanly", info.viewer_id);
                                                 sticker_counts.lock().unwrap().remove(&info.viewer_id);
+                                                reassembler.remove_by_owner(info.viewer_id);
                                                 let _ = disconnect_tx.send(info.viewer_id);
                                             }
                                         }
@@ -1209,13 +1209,9 @@ impl OverlayApp {
                             }
 
                             _ = nack_tick.tick() => {
-                                for (sticker_id, missing) in reassembler.collect_nacks() {
-                                    // Find which peer owns this sticker and send them the NACK.
-                                    for (&addr, info) in &peers {
-                                        // We don't track sticker→peer mapping directly; broadcast to all peers.
-                                        // The viewer ignores NACKs for sticker_ids it didn't upload.
+                                for (sticker_id, owner, missing) in reassembler.collect_nacks() {
+                                    if let Some((&addr, _)) = peers.iter().find(|(_, p)| p.viewer_id == owner) {
                                         let _ = transport.send_image_nack(addr, sticker_id, &missing).await;
-                                        let _ = info.viewer_id; // silence unused warning
                                     }
                                 }
                             }

@@ -15,7 +15,6 @@ pub struct HostSticker {
     pub image_bytes: Vec<u8>,   // PNG or JPEG bytes ready for egui texture load
     pub pos:         NormPoint,
     pub size:        NormPoint,
-    pub owner:       Uuid,
 }
 
 /// A live sticker entry on the host egui side (texture loaded, ready to paint).
@@ -105,8 +104,8 @@ impl StickerReassembler {
         self.try_assemble(sticker_id)
     }
 
-    /// Returns (sticker_id, missing_indices) for each sticker pending > 3 s with gaps.
-    pub fn collect_nacks(&self) -> Vec<(u64, Vec<u16>)> {
+    /// Returns (sticker_id, owner, missing_indices) for each sticker pending > 3 s with gaps.
+    pub fn collect_nacks(&self) -> Vec<(u64, Uuid, Vec<u16>)> {
         let now = Instant::now();
         self.pending.iter()
             .filter(|(_, p)| now.duration_since(p.arrived_at).as_secs() >= 3)
@@ -114,7 +113,7 @@ impl StickerReassembler {
                 let missing: Vec<u16> = (0..p.total)
                     .filter(|i| !p.chunks.contains_key(i))
                     .collect();
-                if missing.is_empty() { None } else { Some((id, missing)) }
+                if missing.is_empty() { None } else { Some((id, p.owner, missing)) }
             })
             .collect()
     }
@@ -123,14 +122,18 @@ impl StickerReassembler {
         self.pending.remove(&sticker_id);
     }
 
+    pub fn remove_by_owner(&mut self, viewer_id: Uuid) {
+        self.pending.retain(|_, p| p.owner != viewer_id);
+    }
+
     fn try_assemble(&mut self, sticker_id: u64) -> AssembleResult {
         let entry = match self.pending.get(&sticker_id) {
             Some(e) => e,
             None    => return AssembleResult::Pending,
         };
         if entry.chunks.len() != entry.total as usize { return AssembleResult::Pending; }
-        let (sha256, pos, size, owner) = match (entry.sha256, entry.pos, entry.size) {
-            (Some(h), Some(p), Some(s)) => (h, p, s, entry.owner),
+        let (sha256, pos, size) = match (entry.sha256, entry.pos, entry.size) {
+            (Some(h), Some(p), Some(s)) => (h, p, s),
             _ => return AssembleResult::Pending, // manifest not yet received
         };
 
@@ -154,7 +157,7 @@ impl StickerReassembler {
             return AssembleResult::Corrupt;
         }
 
-        AssembleResult::Complete(HostSticker { image_bytes: assembled, pos, size, owner })
+        AssembleResult::Complete(HostSticker { image_bytes: assembled, pos, size })
     }
 }
 
@@ -163,7 +166,6 @@ impl StickerReassembler {
 /// A sticker as tracked by the viewer that uploaded it.
 pub struct ViewerSticker {
     pub sticker_id: u64,
-    pub image_bytes: Vec<u8>,
     pub pos:  NormPoint,
     pub size: NormPoint,
 }

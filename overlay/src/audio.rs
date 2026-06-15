@@ -49,7 +49,8 @@ pub fn probe_devices() -> (bool, Vec<AudioDeviceInfo>) {
     let infos: Vec<AudioDeviceInfo> = devs
         .filter_map(|d| {
             let name = d.name().ok()?;
-            Some(AudioDeviceInfo { name, is_monitor: false })
+            let is_monitor = name.ends_with(".monitor");
+            Some(AudioDeviceInfo { name, is_monitor })
         })
         .collect();
 
