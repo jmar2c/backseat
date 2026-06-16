@@ -1,9 +1,9 @@
 use crate::vpx::ffi::*;
 use std::mem::MaybeUninit;
 
-/// VP8 encoder wrapping the libvpx FFI.  Lives on its own OS thread because
+/// VP9 encoder wrapping the libvpx FFI.  Lives on its own OS thread because
 /// the libvpx context is not `Sync`.
-pub struct Vp8Encoder {
+pub struct Vp9Encoder {
     ctx:           vpx_codec_ctx_t,
     cfg:           vpx_codec_enc_cfg_t,  // kept for live bitrate updates
     image:         *mut vpx_image_t,
@@ -12,10 +12,10 @@ pub struct Vp8Encoder {
 }
 
 // SAFETY: only ever used from a single OS thread (the capture thread).
-unsafe impl Send for Vp8Encoder {}
+unsafe impl Send for Vp9Encoder {}
 
-impl Vp8Encoder {
-    /// Initialise a CBR VP8 encoder for `width × height` frames.
+impl Vp9Encoder {
+    /// Initialise a CBR VP9 encoder for `width × height` frames.
     ///
     /// `kf_frames` controls how often a forced keyframe is emitted (encoder units = frames).
     /// `g_error_resilient` is enabled so the decoder can recover if UDP packets are
@@ -23,7 +23,7 @@ impl Vp8Encoder {
     /// `g_lag_in_frames = 0` disables lookahead, keeping encoding latency at one frame.
     pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32, kf_frames: u64) -> Result<Self, String> {
         unsafe {
-            let iface = vpx_codec_vp8_cx();
+            let iface = vpx_codec_vp9_cx();
 
             let mut cfg = MaybeUninit::<vpx_codec_enc_cfg_t>::uninit();
             let err = vpx_codec_enc_config_default(iface, cfg.as_mut_ptr(), 0);
@@ -73,10 +73,12 @@ impl Vp8Encoder {
                 return Err("vpx_img_alloc returned null".into());
             }
 
-            // VP8-specific controls for screen content quality.
-            vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED,           4i32);  // real-time mode
-            vpx_codec_control_(&mut ctx, VP8E_SET_NOISE_SENSITIVITY, 0u32);  // no denoising — blurs text
-            vpx_codec_control_(&mut ctx, VP8E_SET_STATIC_THRESHOLD,  0u32);  // encode all blocks
+            // VP9 controls for real-time screen content.
+            vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED,           8i32);  // VP9 speed 0-9; 8 = real-time
+            vpx_codec_control_(&mut ctx, VP9E_SET_NOISE_SENSITIVITY, 0u32);  // disable denoiser — blurs text
+            vpx_codec_control_(&mut ctx, VP9E_SET_TILE_COLUMNS,      6i32);  // 2^6 tile columns for threading
+            vpx_codec_control_(&mut ctx, VP9E_SET_ROW_MT,            1u32);  // row-based multi-threading
+            vpx_codec_control_(&mut ctx, VP9E_SET_TUNE_CONTENT,      VP9E_CONTENT_SCREEN);
 
             tracing::debug!("encoder init {width}x{height} {bitrate_kbps}kbps {fps}fps kf_every={kf_frames}");
             let pts_per_frame = (90_000 / fps) as i64;
@@ -99,7 +101,7 @@ impl Vp8Encoder {
 
     /// Encode one BGRA frame.
     ///
-    /// Returns `(vp8_bitstream, rtp_ts)` where `rtp_ts` is the 90 kHz presentation
+    /// Returns `(vp9_bitstream, rtp_ts)` where `rtp_ts` is the 90 kHz presentation
     /// timestamp used for this frame — pass it directly to [`Transport::send_video`].
     pub fn encode(&mut self, bgra: &[u8], force_keyframe: bool) -> Option<(Vec<u8>, u32)> {
         unsafe {
@@ -178,7 +180,7 @@ impl Vp8Encoder {
     }
 }
 
-impl Drop for Vp8Encoder {
+impl Drop for Vp9Encoder {
     fn drop(&mut self) {
         unsafe {
             vpx_codec_destroy(&mut self.ctx);

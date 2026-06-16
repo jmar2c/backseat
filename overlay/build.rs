@@ -44,6 +44,7 @@ fn main() {
         vpx = vpx.clang_arg(format!("-I{}", path.display()));
     }
     vpx.allowlist_function("vpx_codec_vp8_cx")
+        .allowlist_function("vpx_codec_vp9_cx")
         .allowlist_function("vpx_codec_enc_config_default")
         .allowlist_function("vpx_codec_enc_config_set")
         .allowlist_function("vpx_codec_enc_init_ver")
@@ -53,6 +54,7 @@ fn main() {
         .allowlist_function("vpx_img_alloc")
         .allowlist_function("vpx_img_free")
         .allowlist_function("vpx_codec_vp8_dx")
+        .allowlist_function("vpx_codec_vp9_dx")
         .allowlist_function("vpx_codec_dec_init_ver")
         .allowlist_function("vpx_codec_decode")
         .allowlist_function("vpx_codec_get_frame")

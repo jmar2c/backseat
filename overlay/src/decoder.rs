@@ -1,18 +1,18 @@
 use crate::vpx::ffi::*;
 use std::mem::MaybeUninit;
 
-/// VP8 decoder wrapping the libvpx FFI.  Runs on its own OS thread.
-pub struct Vp8Decoder {
+/// VP9 decoder wrapping the libvpx FFI.  Runs on its own OS thread.
+pub struct Vp9Decoder {
     ctx: vpx_codec_ctx_t,
 }
 
 // Only ever used from the dedicated decode thread.
-unsafe impl Send for Vp8Decoder {}
+unsafe impl Send for Vp9Decoder {}
 
-impl Vp8Decoder {
+impl Vp9Decoder {
     pub fn new() -> Result<Self, String> {
         unsafe {
-            let iface = vpx_codec_vp8_dx();
+            let iface = vpx_codec_vp9_dx();
             let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
             let err = vpx_codec_dec_init_ver(
                 ctx.as_mut_ptr(),
@@ -28,7 +28,7 @@ impl Vp8Decoder {
         }
     }
 
-    /// Decode one VP8 frame.  Returns `(width, height, rgba_bytes)` or `None` on error.
+    /// Decode one VP9 frame.  Returns `(width, height, rgba_bytes)` or `None` on error.
     /// The caller does not need to distinguish keyframes — libvpx handles that internally.
     pub fn decode(&mut self, data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         unsafe {
@@ -56,7 +56,7 @@ impl Vp8Decoder {
     }
 }
 
-impl Drop for Vp8Decoder {
+impl Drop for Vp9Decoder {
     fn drop(&mut self) {
         unsafe { vpx_codec_destroy(&mut self.ctx); }
     }

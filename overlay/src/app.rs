@@ -22,9 +22,9 @@ fn keepalive<T: 'static>(v: T) {
 }
 use crate::capture::ScreenCapture;
 use crate::cursor::CursorState;
-use crate::decoder::Vp8Decoder;
+use crate::decoder::Vp9Decoder;
 use crate::draw_layer::DrawLayer;
-use crate::encoder::Vp8Encoder;
+use crate::encoder::Vp9Encoder;
 use crate::transport::{Packet, Reassembler, RoomCode, Transport};
 use crate::types::{AnnotMsg, NormPoint, UserColor, UserId, UserInfo};
 
@@ -1097,7 +1097,7 @@ impl OverlayApp {
                             return;
                         }
                     };
-                    let mut enc = match Vp8Encoder::new(cap.width as u32, cap.height as u32, initial_bitrate, fps, kf_frames) {
+                    let mut enc = match Vp9Encoder::new(cap.width as u32, cap.height as u32, initial_bitrate, fps, kf_frames) {
                         Ok(e)  => e,
                         Err(e) => { tracing::warn!("encoder init failed: {e}"); return; }
                     };
@@ -1158,7 +1158,7 @@ impl OverlayApp {
                                             cap = new_cap;
                                             if nw != enc_w || nh != enc_h {
                                                 tracing::info!("resolution changed {enc_w}x{enc_h} → {nw}x{nh}, rebuilding encoder");
-                                                match Vp8Encoder::new(nw as u32, nh as u32, current_bitrate, fps, kf_frames) {
+                                                match Vp9Encoder::new(nw as u32, nh as u32, current_bitrate, fps, kf_frames) {
                                                     Ok(new_enc) => { enc = new_enc; enc_w = nw; enc_h = nh; n = 0; }
                                                     Err(e) => tracing::warn!("encoder rebuild failed: {e}"),
                                                 }
@@ -1509,9 +1509,9 @@ impl OverlayApp {
                     Err(e) => { tracing::warn!("audio player unavailable: {e}"); None }
                 };
 
-            // VP8 decode thread.
+            // VP9 decode thread.
             std::thread::spawn(move || {
-                let mut dec = match Vp8Decoder::new() {
+                let mut dec = match Vp9Decoder::new() {
                     Ok(d)  => d,
                     Err(e) => { tracing::error!("decoder init: {e}"); return; }
                 };

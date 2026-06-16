@@ -3,7 +3,7 @@
 //! Packet layout:
 //! ```text
 //! [0x01]                                                    PKT_PUNCH
-//! [0x02][RTP-12][idx:u16be][total:u16be][flags:u8][data…]   PKT_VIDEO  (VP8 fragment)
+//! [0x02][RTP-12][idx:u16be][total:u16be][flags:u8][data…]   PKT_VIDEO  (VP9 fragment)
 //! [0x03][utf-8 json…]                                       PKT_ANNOT
 //! [0x04]                                                    PKT_DISCONNECT
 //! [0x05][RTP-12][opus-data…]                                PKT_AUDIO  (Opus frame)
@@ -15,7 +15,7 @@
 //! ```text
 //! [V=2|P=0|X=0|CC=0][M|PT][seq:u16be][timestamp:u32be][ssrc:u32be]
 //! ```
-//! VP8 uses PT=96 (90 kHz clock); Opus uses PT=111 (48 kHz clock).
+//! VP9 uses PT=96 (90 kHz clock); Opus uses PT=111 (48 kHz clock).
 //! For PKT_VIDEO the RTP header is followed by idx/total/flags for reassembly.
 //! Frames are chunked to 1 200 bytes to stay well below typical path MTU.
 
