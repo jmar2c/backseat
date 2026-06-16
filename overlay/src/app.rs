@@ -85,7 +85,7 @@ enum QualityPreset { Low, Medium, High, #[default] Auto }
 
 impl QualityPreset {
     fn bitrate_kbps(self) -> u32 {
-        match self { Self::Low => 1_000, Self::Medium => 2_500, Self::High => 5_000, Self::Auto => 2_500 }
+        match self { Self::Low => 2_000, Self::Medium => 4_000, Self::High => 8_000, Self::Auto => 4_000 }
     }
     fn label(self) -> &'static str {
         match self { Self::Low => "Low", Self::Medium => "Medium", Self::High => "High", Self::Auto => "Auto (ABR)" }
@@ -1133,9 +1133,9 @@ impl OverlayApp {
                                 if is_auto && last_abr.elapsed() >= Duration::from_secs(3) {
                                     let loss = *viewer_loss.lock().unwrap();
                                     let new_bitrate = if loss > 5.0 {
-                                        (current_bitrate * 4 / 5).max(500)
+                                        (current_bitrate * 3 / 4).max(500)
                                     } else if loss < 1.0 {
-                                        (current_bitrate * 11 / 10).min(8_000)
+                                        (current_bitrate * 13 / 10).min(15_000)
                                     } else {
                                         current_bitrate
                                     };

@@ -43,6 +43,11 @@ impl Vp8Encoder {
             cfg.rc_end_usage      = vpx_rc_mode_VPX_CBR;
             cfg.kf_mode           = vpx_kf_mode_VPX_KF_AUTO;
             cfg.kf_max_dist       = kf_frames as u32;
+            // Smaller RC buffers → encoder can't "save up" bits across seconds,
+            // which improves per-frame quality responsiveness for screen content.
+            cfg.rc_buf_sz         = 100;  // ms (default 1000)
+            cfg.rc_buf_initial_sz = 50;
+            cfg.rc_buf_optimal_sz = 100;
 
             let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
             let err = vpx_codec_enc_init_ver(
@@ -55,7 +60,7 @@ impl Vp8Encoder {
             if err != vpx_codec_err_t_VPX_CODEC_OK {
                 return Err(format!("vpx_codec_enc_init_ver: {err}"));
             }
-            let ctx = ctx.assume_init();
+            let mut ctx = ctx.assume_init();
 
             let image = vpx_img_alloc(
                 std::ptr::null_mut(),
@@ -67,6 +72,11 @@ impl Vp8Encoder {
             if image.is_null() {
                 return Err("vpx_img_alloc returned null".into());
             }
+
+            // VP8-specific controls for screen content quality.
+            vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED,           4i32);  // real-time mode
+            vpx_codec_control_(&mut ctx, VP8E_SET_NOISE_SENSITIVITY, 0u32);  // no denoising — blurs text
+            vpx_codec_control_(&mut ctx, VP8E_SET_STATIC_THRESHOLD,  0u32);  // encode all blocks
 
             tracing::debug!("encoder init {width}x{height} {bitrate_kbps}kbps {fps}fps kf_every={kf_frames}");
             let pts_per_frame = (90_000 / fps) as i64;
