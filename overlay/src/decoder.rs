@@ -14,10 +14,15 @@ impl Vp9Decoder {
         unsafe {
             let iface = vpx_codec_vp9_dx();
             let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
+            // VP9 decoding is significantly more CPU-intensive than VP8.
+            // Enabling multi-threaded decode keeps per-frame latency below one frame
+            // period, which prevents the sync_channel(1) from being permanently full
+            // and silently dropping every incoming frame.
+            let cfg = vpx_codec_dec_cfg_t { threads: 4, w: 0, h: 0 };
             let err = vpx_codec_dec_init_ver(
                 ctx.as_mut_ptr(),
                 iface,
-                std::ptr::null(),
+                &cfg,
                 0,
                 VPX_DECODER_ABI_VERSION as i32,
             );

@@ -1638,7 +1638,9 @@ impl OverlayApp {
                                                     if is_kf { got_keyframe = true; }
                                                     if got_keyframe {
                                                         tracing::trace!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
-                                                        let _ = frame_sync_tx.try_send(frame);
+                                                        if frame_sync_tx.try_send(frame).is_err() {
+                                                            tracing::debug!("decode thread busy — dropped frame rtp_ts={rtp_ts}");
+                                                        }
                                                     } else {
                                                         tracing::debug!("dropping P-frame rtp_ts={rtp_ts} before first keyframe");
                                                     }
