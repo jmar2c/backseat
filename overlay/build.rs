@@ -1,23 +1,63 @@
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
+
+const OPUS_VERSION: &str = "1.4";
+const OPUS_URL: &str = "https://downloads.xiph.org/releases/opus/opus-1.4.tar.gz";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let host      = env::var("HOST").unwrap_or_default();
+    let out       = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let (vpx_includes, opus_includes): (Vec<PathBuf>, Vec<PathBuf>) = if target_os == "windows" {
-        // Requires:
-        //   vcpkg install libvpx:x64-windows-static-md opus:x64-windows-static-md
-        //   vcpkg integrate install
-        let vpx = vcpkg::Config::new()
-            .lib_name("vpx")
-            .probe("libvpx")
-            .unwrap_or_else(|e| panic!(
-                "Could not find libvpx via vcpkg: {e}\n\
-                 Run: vcpkg install libvpx:x64-windows-static-md && vcpkg integrate install"
-            ));
+    // Detect Linux→Windows cross-compilation (the primary CI path for producing overlay.exe).
+    let cross_windows = target_os == "windows" && !host.contains("windows");
+
+    // For Windows cross-compilation, ffmpeg-sys-next (without the build feature) uses FFMPEG_DIR
+    // to locate the pre-built FFmpeg. We still need to add x264 and Windows system libs to the
+    // link list — ffmpeg-sys-next only adds avcodec/avutil/swscale, not the libx264 dependency.
+    if cross_windows {
+        let ffmpeg_dir = env::var("FFMPEG_DIR").unwrap_or_else(|_| {
+            panic!(
+                "FFMPEG_DIR must be set when cross-compiling for Windows.\n\
+                 Run scripts/cross-windows.sh instead of cargo directly."
+            )
+        });
+        let ffmpeg_dir = PathBuf::from(&ffmpeg_dir);
+        println!("cargo:rustc-link-search={}", ffmpeg_dir.join("lib").display());
+        // ffmpeg-sys-next bundles libavcodec.a into its rlib (rustc static-lib bundling).
+        // avcodec's libx264.o bridge references x264_* symbols.  cargo:rustc-link-lib
+        // for x264 would appear BEFORE rlibs in the final link and get discarded by GNU ld
+        // (no references to x264 exist yet when it is scanned at that point).
+        // Passing the archive by full path as a rustc-link-arg places it AFTER the rlibs,
+        // so GNU ld can resolve avcodec's x264 references via selective extraction.
+        // x264's extracted objects in turn reference msvcrt/mingwex CRT symbols; those
+        // import libraries must come AFTER x264 so GNU ld can still extract the stubs.
+        // x264 and its transitive Windows CRT/system dependencies (ratecontrol.o uses
+        // log2/_wfopen/fseeko64, win32thread.o uses InitializeCriticalSectionAndSpinCount,
+        // etc.) form a chain that requires --start-group/--end-group so GNU ld rescans
+        // until all cross-archive references settle.
+        let x264_lib = ffmpeg_dir.join("lib").join("libx264.a");
+        println!("cargo:rustc-link-arg=-Wl,--start-group");
+        println!("cargo:rustc-link-arg={}", x264_lib.display());
+        println!("cargo:rustc-link-arg=-lmsvcrt");
+        println!("cargo:rustc-link-arg=-lmingwex");
+        println!("cargo:rustc-link-arg=-lmingw32");
+        println!("cargo:rustc-link-arg=-lgcc");
+        println!("cargo:rustc-link-arg=-lkernel32");
+        println!("cargo:rustc-link-arg=-Wl,--end-group");
+        // Windows system libs needed by the statically-linked FFmpeg.
+        println!("cargo:rustc-link-lib=bcrypt");
+        println!("cargo:rustc-link-lib=ws2_32");
+        println!("cargo:rustc-link-lib=psapi");
+    }
+
+    let opus_includes: Vec<PathBuf> = if cross_windows {
+        build_opus_cross_windows(&out)
+    } else if target_os == "windows" {
+        // Native Windows dev: vcpkg must provide opus:x64-windows-static-md.
         let opus = vcpkg::Config::new()
             .lib_name("opus")
             .probe("opus")
@@ -25,72 +65,23 @@ fn main() {
                 "Could not find libopus via vcpkg: {e}\n\
                  Run: vcpkg install opus:x64-windows-static-md && vcpkg integrate install"
             ));
-        (vpx.include_paths, opus.include_paths)
+        opus.include_paths
     } else {
-        println!("cargo:rustc-link-lib=vpx");
-        println!("cargo:rustc-link-lib=opus");
-        (vec![], vec![])
+        // Linux native: system libopus-dev provides the static lib.
+        println!("cargo:rustc-link-lib=static=opus");
+        vec![]
     };
 
-    // ── VPX bindings ──────────────────────────────────────────────────────────
-
-    let mut vpx = bindgen::Builder::default()
-        .header_contents(
-            "vpx_wrapper.h",
-            "#include <vpx/vpx_encoder.h>\n#include <vpx/vp8cx.h>\n\
-             #include <vpx/vpx_decoder.h>\n#include <vpx/vp8dx.h>\n",
-        );
-    for path in &vpx_includes {
-        vpx = vpx.clang_arg(format!("-I{}", path.display()));
-    }
-    vpx.allowlist_function("vpx_codec_vp8_cx")
-        .allowlist_function("vpx_codec_vp9_cx")
-        .allowlist_function("vpx_codec_enc_config_default")
-        .allowlist_function("vpx_codec_enc_config_set")
-        .allowlist_function("vpx_codec_enc_init_ver")
-        .allowlist_function("vpx_codec_encode")
-        .allowlist_function("vpx_codec_get_cx_data")
-        .allowlist_function("vpx_codec_destroy")
-        .allowlist_function("vpx_img_alloc")
-        .allowlist_function("vpx_img_free")
-        .allowlist_function("vpx_codec_vp8_dx")
-        .allowlist_function("vpx_codec_vp9_dx")
-        .allowlist_function("vpx_codec_dec_init_ver")
-        .allowlist_function("vpx_codec_decode")
-        .allowlist_function("vpx_codec_get_frame")
-        .allowlist_type("vpx_codec_ctx_t")
-        .allowlist_type("vpx_codec_enc_cfg_t")
-        .allowlist_type("vpx_codec_dec_cfg_t")
-        .allowlist_type("vpx_image_t")
-        .allowlist_type("vpx_codec_cx_pkt_t")
-        .allowlist_type("vpx_codec_cx_pkt_kind")
-        .allowlist_type("vpx_img_fmt")
-        .allowlist_type("vpx_codec_err_t")
-        .allowlist_type("vpx_rc_mode")
-        .allowlist_type("vpx_kf_mode")
-        .allowlist_type("vpx_enc_frame_flags_t")
-        .allowlist_var("VPX_ENCODER_ABI_VERSION")
-        .allowlist_var("VPX_DL_REALTIME")
-        .allowlist_var("VPX_DL_GOOD_QUALITY")
-        .allowlist_var("VPX_EFLAG_FORCE_KF")
-        .allowlist_var("VPX_ERROR_RESILIENT_DEFAULT")
-        .allowlist_var("VPX_CODEC_OK")
-        .allowlist_var("VPX_DECODER_ABI_VERSION")
-        .allowlist_var("VPX_CBR")
-        .allowlist_var("VPX_KF_AUTO")
-        .allowlist_var("VPX_IMG_FMT_I420")
-        .allowlist_var("VPX_CODEC_CX_FRAME_PKT")
-        .generate()
-        .expect("Unable to generate vpx bindings")
-        .write_to_file(out.join("vpx_bindings.rs"))
-        .expect("Couldn't write vpx_bindings.rs");
-
-    // ── Opus bindings ─────────────────────────────────────────────────────────
+    // ── Opus bindings ──────────────────────────────────────────────────────────
 
     let mut opus = bindgen::Builder::default()
         .header_contents("opus_wrapper.h", "#include <opus/opus.h>\n");
     for path in &opus_includes {
         opus = opus.clang_arg(format!("-I{}", path.display()));
+    }
+    if cross_windows {
+        // Tell clang the target ABI so generated types (size_t, etc.) are correct for Windows.
+        opus = opus.clang_arg("--target=x86_64-w64-mingw32");
     }
     opus.allowlist_function("opus_encoder_create")
         .allowlist_function("opus_encode_float")
@@ -107,4 +98,76 @@ fn main() {
         .expect("Unable to generate opus bindings")
         .write_to_file(out.join("opus_bindings.rs"))
         .expect("Couldn't write opus_bindings.rs");
+}
+
+/// Download Opus source and cross-compile it for Windows using the MinGW toolchain.
+///
+/// Requires `x86_64-w64-mingw32-gcc` in PATH (installed via `apt install mingw-w64`).
+/// The compiled library is cached in OUT_DIR between incremental builds.
+fn build_opus_cross_windows(out: &PathBuf) -> Vec<PathBuf> {
+    let install_dir = out.join("opus-windows");
+    let lib_file    = install_dir.join("lib").join("libopus.a");
+
+    if !lib_file.exists() {
+        let src_dir = out.join(format!("opus-{}", OPUS_VERSION));
+        let tarball = out.join("opus.tar.gz");
+
+        // Download the Opus source tarball.
+        if !tarball.exists() {
+            let status = Command::new("curl")
+                .args(["-sSL", "--fail", OPUS_URL, "-o", tarball.to_str().unwrap()])
+                .status()
+                .expect("failed to run curl — is curl installed?");
+            assert!(status.success(), "curl failed to download {OPUS_URL}");
+        }
+
+        // Extract.
+        if !src_dir.exists() {
+            let status = Command::new("tar")
+                .args(["-xzf", tarball.to_str().unwrap(), "-C", out.to_str().unwrap()])
+                .status()
+                .expect("failed to run tar");
+            assert!(status.success(), "tar failed to extract opus tarball");
+        }
+
+        // Configure: tell autotools to build for x86_64-w64-mingw32.
+        // The MinGW gcc (x86_64-w64-mingw32-gcc) is picked up automatically via --host.
+        let status = Command::new(src_dir.join("configure"))
+            .args([
+                "--host=x86_64-w64-mingw32",
+                &format!("--prefix={}", install_dir.display()),
+                "--enable-static",
+                "--disable-shared",
+                "--disable-doc",
+                "--disable-extra-programs",
+            ])
+            .current_dir(&src_dir)
+            .status()
+            .expect("failed to run opus ./configure");
+        assert!(status.success(), "opus ./configure returned non-zero");
+
+        // Compile.
+        let jobs = std::thread::available_parallelism()
+            .map(|n| n.get().to_string())
+            .unwrap_or_else(|_| "4".to_string());
+        let status = Command::new("make")
+            .args(["-j", &jobs])
+            .current_dir(&src_dir)
+            .status()
+            .expect("failed to run make for opus");
+        assert!(status.success(), "opus make returned non-zero");
+
+        // Install to prefix.
+        let status = Command::new("make")
+            .arg("install")
+            .current_dir(&src_dir)
+            .status()
+            .expect("failed to run make install for opus");
+        assert!(status.success(), "opus make install returned non-zero");
+    }
+
+    println!("cargo:rustc-link-search={}", install_dir.join("lib").display());
+    println!("cargo:rustc-link-lib=static=opus");
+
+    vec![install_dir.join("include")]
 }

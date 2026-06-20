@@ -13,7 +13,6 @@ mod encoder;
 mod renderer;
 mod transport;
 mod tray;
-mod vpx;
 
 fn main() {
     dotenvy::dotenv().ok();

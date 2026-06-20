@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-gnu]
+# Embed the MinGW CRT statically so the Windows binary has no libgcc_s_seh-1.dll
+# or libwinpthread-1.dll runtime dependencies.
+rustflags = ["-C", "target-feature=+crt-static"]

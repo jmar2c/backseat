@@ -32,23 +32,15 @@ impl ScreenCapture {
         Ok(Self { screen, width, height })
     }
 
-    /// Capture the current frame.  Returns `Ok(Some(bgra))` on success or
+    /// Capture the current frame.  Returns `Ok(Some(rgba))` on success or
     /// `Err` on failure (e.g. display removed, resolution changed mid-session).
     /// `Ok(None)` is never returned — unlike scrap there is no WouldBlock concept.
     ///
-    /// Output bytes are in BGRA order as expected by the VP8 encoder.
+    /// Output bytes are RGBA as produced by the screenshots crate.
     pub fn capture(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
         self.screen
             .capture()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            .map(|img| {
-                // The screenshots crate stores pixels as RGBA (image::RgbaImage).
-                // The encoder expects BGRA — swap R and B in each pixel.
-                let mut data = img.into_raw();
-                for px in data.chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
-                Some(data)
-            })
+            .map(|img| Some(img.into_raw()))
     }
 }

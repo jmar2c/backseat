@@ -3,7 +3,7 @@
 //! Packet layout:
 //! ```text
 //! [0x01]                                                    PKT_PUNCH
-//! [0x02][RTP-12][idx:u16be][total:u16be][flags:u8][data…]   PKT_VIDEO  (VP9 fragment)
+//! [0x02][RTP-12][idx:u16be][total:u16be][flags:u8][data…]   PKT_VIDEO  (H.264 Annex B fragment)
 //! [0x03][utf-8 json…]                                       PKT_ANNOT
 //! [0x04]                                                    PKT_DISCONNECT
 //! [0x05][RTP-12][opus-data…]                                PKT_AUDIO  (Opus frame)
@@ -15,7 +15,7 @@
 //! ```text
 //! [V=2|P=0|X=0|CC=0][M|PT][seq:u16be][timestamp:u32be][ssrc:u32be]
 //! ```
-//! VP9 uses PT=96 (90 kHz clock); Opus uses PT=111 (48 kHz clock).
+//! H.264 uses PT=96 (90 kHz clock); Opus uses PT=111 (48 kHz clock).
 //! For PKT_VIDEO the RTP header is followed by idx/total/flags for reassembly.
 //! Frames are chunked to 1 200 bytes to stay well below typical path MTU.
 
@@ -39,7 +39,7 @@ const PKT_PING:           u8 = 0x0A;
 const PKT_PONG:           u8 = 0x0B;
 const PKT_STATS:          u8 = 0x0C;
 
-const RTP_PT_VP8:  u8 = 96;
+const RTP_PT_H264: u8 = 96;
 const RTP_PT_OPUS: u8 = 111;
 
 /// Maximum payload per UDP datagram — chosen to stay under typical path MTU.
@@ -169,7 +169,7 @@ impl Transport {
             pkt.push(PKT_VIDEO);
             // 12-byte RTP header
             pkt.push(0x80); // V=2, P=0, X=0, CC=0
-            pkt.push(RTP_PT_VP8 | if marker { 0x80 } else { 0x00 }); // M|PT
+            pkt.push(RTP_PT_H264 | if marker { 0x80 } else { 0x00 }); // M|PT
             pkt.extend_from_slice(&seq.to_be_bytes());
             pkt.extend_from_slice(&rtp_ts.to_be_bytes());
             pkt.extend_from_slice(&self.ssrc.to_be_bytes());

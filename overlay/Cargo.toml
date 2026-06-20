@@ -31,8 +31,21 @@ vcpkg = "0.2"
 ksni = "0.2"
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 raw-window-handle = "0.6"
+# VAAPI hardware encoding included; Windows cross-compile omits it (VAAPI doesn't exist on Windows).
+ffmpeg-sys-next = { version = "7", default-features = false, features = [
+    "avcodec", "swscale",
+    "build", "build-lib-x264", "build-license-gpl", "build-vaapi",
+    "static",
+] }
 
 [target.'cfg(windows)'.dependencies]
 # Needed for transparent click-through windows on Windows
 winapi = { version = "0.3", features = ["winuser", "wingdi"] }
 tray-icon = "0.14"
+# No build* features: ffmpeg-sys-next's build feature passes --target-os=windows to FFmpeg configure
+# which FFmpeg rejects (it needs --target-os=mingw32). Instead we pre-build FFmpeg ourselves via
+# scripts/cross-windows.sh and point ffmpeg-sys-next at the result via FFMPEG_DIR.
+ffmpeg-sys-next = { version = "7", default-features = false, features = [
+    "avcodec", "swscale",
+    "static",
+] }

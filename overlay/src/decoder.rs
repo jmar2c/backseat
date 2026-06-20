@@ -1,101 +1,129 @@
-use crate::vpx::ffi::*;
-use std::mem::MaybeUninit;
+#![allow(non_upper_case_globals, non_camel_case_types)]
 
-/// VP9 decoder wrapping the libvpx FFI.  Runs on its own OS thread.
-pub struct Vp9Decoder {
-    ctx: vpx_codec_ctx_t,
+use ffmpeg_sys_next as sys;
+use std::ptr;
+
+/// H.264 decoder using FFmpeg.  Runs on its own OS thread.
+pub struct H264Decoder {
+    codec_ctx: *mut sys::AVCodecContext,
+    /// Lazily initialised swscale context; rebuilt when frame dimensions change.
+    sws_ctx:   *mut sys::SwsContext,
+    packet:    *mut sys::AVPacket,
+    frame:     *mut sys::AVFrame,
+    sws_w:     u32,
+    sws_h:     u32,
 }
 
 // Only ever used from the dedicated decode thread.
-unsafe impl Send for Vp9Decoder {}
+unsafe impl Send for H264Decoder {}
 
-impl Vp9Decoder {
+impl H264Decoder {
     pub fn new() -> Result<Self, String> {
         unsafe {
-            let iface = vpx_codec_vp9_dx();
-            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
-            // VP9 decoding is significantly more CPU-intensive than VP8.
-            // Enabling multi-threaded decode keeps per-frame latency below one frame
-            // period, which prevents the sync_channel(1) from being permanently full
-            // and silently dropping every incoming frame.
-            let cfg = vpx_codec_dec_cfg_t { threads: 4, w: 0, h: 0 };
-            let err = vpx_codec_dec_init_ver(
-                ctx.as_mut_ptr(),
-                iface,
-                &cfg,
-                0,
-                VPX_DECODER_ABI_VERSION as i32,
-            );
-            if err != vpx_codec_err_t_VPX_CODEC_OK {
-                return Err(format!("vpx_codec_dec_init_ver: {err}"));
+            let codec = sys::avcodec_find_decoder(sys::AVCodecID::AV_CODEC_ID_H264);
+            if codec.is_null() {
+                return Err("H264 decoder not found".into());
             }
-            Ok(Self { ctx: ctx.assume_init() })
+
+            let codec_ctx = sys::avcodec_alloc_context3(codec);
+            if codec_ctx.is_null() {
+                return Err("avcodec_alloc_context3 failed".into());
+            }
+
+            (*codec_ctx).thread_count = 4;
+            (*codec_ctx).thread_type  = sys::FF_THREAD_SLICE as i32;
+            // Emit corrupt frames rather than nothing on UDP packet loss so the
+            // viewer sees degraded-but-moving video instead of a frozen frame.
+            (*codec_ctx).flags |= sys::AV_CODEC_FLAG_OUTPUT_CORRUPT as i32;
+
+            let ret = sys::avcodec_open2(codec_ctx, codec, ptr::null_mut());
+            if ret < 0 {
+                sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+                return Err(format!("avcodec_open2: {ret}"));
+            }
+
+            Ok(Self {
+                codec_ctx,
+                sws_ctx: ptr::null_mut(),
+                packet:  sys::av_packet_alloc(),
+                frame:   sys::av_frame_alloc(),
+                sws_w: 0,
+                sws_h: 0,
+            })
         }
     }
 
-    /// Decode one VP9 frame.  Returns `(width, height, rgba_bytes)` or `None` on error.
-    /// The caller does not need to distinguish keyframes — libvpx handles that internally.
+    /// Decode one H.264 Annex B frame.  Returns `(width, height, rgba_bytes)` or `None`.
     pub fn decode(&mut self, data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         unsafe {
-            let err = vpx_codec_decode(
-                &mut self.ctx,
-                data.as_ptr(),
-                data.len() as u32,
-                std::ptr::null_mut(),
-                0,
-            );
-            if err != vpx_codec_err_t_VPX_CODEC_OK {
-                tracing::warn!("vpx_codec_decode: {err}");
+            sys::av_packet_unref(self.packet);
+            let ret = sys::av_new_packet(self.packet, data.len() as i32);
+            if ret < 0 { return None; }
+            ptr::copy_nonoverlapping(data.as_ptr(), (*self.packet).data, data.len());
+
+            let ret = sys::avcodec_send_packet(self.codec_ctx, self.packet);
+            if ret < 0 {
+                tracing::warn!("avcodec_send_packet: {ret}");
                 return None;
             }
 
-            let mut iter: vpx_codec_iter_t = std::ptr::null();
-            let img = vpx_codec_get_frame(&mut self.ctx, &mut iter);
-            if img.is_null() { return None; }
+            sys::av_frame_unref(self.frame);
+            if sys::avcodec_receive_frame(self.codec_ctx, self.frame) < 0 {
+                return None;
+            }
 
-            let img = &*img;
-            let w = img.d_w as usize;
-            let h = img.d_h as usize;
-            Some((w as u32, h as u32, i420_to_rgba(img, w, h)))
+            let w   = (*self.frame).width  as u32;
+            let h   = (*self.frame).height as u32;
+            let fmt: sys::AVPixelFormat =
+                std::mem::transmute::<i32, sys::AVPixelFormat>((*self.frame).format);
+
+            // Rebuild swscale when dimensions (or format) change
+            if self.sws_ctx.is_null() || self.sws_w != w || self.sws_h != h {
+                if !self.sws_ctx.is_null() {
+                    sys::sws_freeContext(self.sws_ctx);
+                }
+                self.sws_ctx = sys::sws_getContext(
+                    w as i32, h as i32, fmt,
+                    w as i32, h as i32, sys::AVPixelFormat::AV_PIX_FMT_RGBA,
+                    sys::SWS_FAST_BILINEAR as i32,
+                    ptr::null_mut(), ptr::null_mut(), ptr::null(),
+                );
+                self.sws_w = w;
+                self.sws_h = h;
+                if w > 0 && h > 0 {
+                    tracing::debug!("first decoded frame {w}x{h}");
+                }
+            }
+            if self.sws_ctx.is_null() { return None; }
+
+            let mut rgba = vec![0u8; w as usize * h as usize * 4];
+            let dst_data:    [*mut u8; 8] = [
+                rgba.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+            ];
+            let dst_linesize:[i32; 8]     = [w as i32 * 4, 0, 0, 0, 0, 0, 0, 0];
+
+            sys::sws_scale(
+                self.sws_ctx,
+                (*self.frame).data.as_ptr() as *const *const u8,
+                (*self.frame).linesize.as_ptr(),
+                0, h as i32,
+                dst_data.as_ptr() as *const *mut u8,
+                dst_linesize.as_ptr(),
+            );
+
+            Some((w, h, rgba))
         }
     }
 }
 
-impl Drop for Vp9Decoder {
+impl Drop for H264Decoder {
     fn drop(&mut self) {
-        unsafe { vpx_codec_destroy(&mut self.ctx); }
-    }
-}
-
-/// Convert a libvpx I420 image to packed RGBA using BT.601 full-range coefficients.
-unsafe fn i420_to_rgba(img: &vpx_image_t, w: usize, h: usize) -> Vec<u8> {
-    let y_stride = img.stride[0] as usize;
-    let u_stride = img.stride[1] as usize;
-    let v_stride = img.stride[2] as usize;
-    let y_plane  = img.planes[0];
-    let u_plane  = img.planes[1];
-    let v_plane  = img.planes[2];
-
-    // Pre-fill alpha to 255; inner loop only writes RGB.
-    let mut rgba = vec![255u8; w * h * 4];
-
-    for row in 0..h {
-        for col in 0..w {
-            let y = *y_plane.add(row * y_stride + col) as i32 - 16;
-            // U/V are 2×2 subsampled — index into the half-resolution chroma planes.
-            let u = *u_plane.add((row / 2) * u_stride + col / 2) as i32 - 128;
-            let v = *v_plane.add((row / 2) * v_stride + col / 2) as i32 - 128;
-
-            let r = (298 * y + 409 * v + 128) >> 8;
-            let g = (298 * y - 100 * u - 208 * v + 128) >> 8;
-            let b = (298 * y + 516 * u + 128) >> 8;
-
-            let i = (row * w + col) * 4;
-            rgba[i]     = r.clamp(0, 255) as u8;
-            rgba[i + 1] = g.clamp(0, 255) as u8;
-            rgba[i + 2] = b.clamp(0, 255) as u8;
+        unsafe {
+            if !self.sws_ctx.is_null()   { sys::sws_freeContext(self.sws_ctx); }
+            if !self.frame.is_null()     { sys::av_frame_free(&mut self.frame); }
+            if !self.packet.is_null()    { sys::av_packet_free(&mut self.packet); }
+            if !self.codec_ctx.is_null() { sys::avcodec_free_context(&mut self.codec_ctx); }
         }
     }
-
-    rgba
 }

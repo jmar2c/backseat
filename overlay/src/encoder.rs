@@ -1,192 +1,316 @@
-use crate::vpx::ffi::*;
-use std::mem::MaybeUninit;
+#![allow(non_upper_case_globals, non_camel_case_types)]
 
-/// VP9 encoder wrapping the libvpx FFI.  Lives on its own OS thread because
-/// the libvpx context is not `Sync`.
-pub struct Vp9Encoder {
-    ctx:           vpx_codec_ctx_t,
-    cfg:           vpx_codec_enc_cfg_t,  // kept for live bitrate updates
-    image:         *mut vpx_image_t,
+use ffmpeg_sys_next as sys;
+use std::ffi::CString;
+use std::ptr;
+
+/// H.264 encoder using FFmpeg.  Tries hardware encoders (VAAPI on Linux,
+/// NVENC/QSV on Windows) and falls back to libx264 if none are available.
+/// Lives on its own OS thread because AVCodecContext is not Sync.
+pub struct H264Encoder {
+    codec_ctx:     *mut sys::AVCodecContext,
+    sws_ctx:       *mut sys::SwsContext,
+    /// CPU-side frame: RGBA is scaled into this (YUV420P or NV12).
+    sw_frame:      *mut sys::AVFrame,
+    /// GPU-side frame used only for VAAPI; null for software encoders.
+    hw_frame:      *mut sys::AVFrame,
+    packet:        *mut sys::AVPacket,
     pts:           i64,
     pts_per_frame: i64,
+    /// Kept alive for the lifetime of the VAAPI encoder; null otherwise.
+    hw_device_ctx: *mut sys::AVBufferRef,
 }
 
 // SAFETY: only ever used from a single OS thread (the capture thread).
-unsafe impl Send for Vp9Encoder {}
+unsafe impl Send for H264Encoder {}
 
-impl Vp9Encoder {
-    /// Initialise a CBR VP9 encoder for `width × height` frames.
-    ///
-    /// `kf_frames` controls how often a forced keyframe is emitted (encoder units = frames).
-    /// `g_error_resilient` is enabled so the decoder can recover if UDP packets are
-    /// lost mid-stream without waiting for the next keyframe.
-    /// `g_lag_in_frames = 0` disables lookahead, keeping encoding latency at one frame.
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32, kf_frames: u64) -> Result<Self, String> {
-        unsafe {
-            let iface = vpx_codec_vp9_cx();
+impl H264Encoder {
+    /// Initialise an H.264 encoder.  Hardware encoders are tried first; the
+    /// first one that opens successfully is used.  Falls back to libx264.
+    pub fn new(
+        width: u32, height: u32, bitrate_kbps: u32, fps: u32, kf_frames: u64,
+    ) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        const CANDIDATES: &[&str] = &["h264_vaapi", "h264_nvenc", "h264_qsv", "libx264"];
+        #[cfg(target_os = "windows")]
+        const CANDIDATES: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"];
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        const CANDIDATES: &[&str] = &["libx264"];
 
-            let mut cfg = MaybeUninit::<vpx_codec_enc_cfg_t>::uninit();
-            let err = vpx_codec_enc_config_default(iface, cfg.as_mut_ptr(), 0);
-            if err != vpx_codec_err_t_VPX_CODEC_OK {
-                return Err(format!("vpx_codec_enc_config_default: {err}"));
+        for &name in CANDIDATES {
+            match unsafe { Self::try_init(name, width, height, bitrate_kbps, fps, kf_frames) } {
+                Ok(enc) => {
+                    tracing::info!("H264 encoder: {name} {width}x{height} {bitrate_kbps}kbps {fps}fps kf_every={kf_frames}");
+                    return Ok(enc);
+                }
+                Err(e) => tracing::debug!("H264 encoder: {name} unavailable: {e}"),
             }
-            let mut cfg = cfg.assume_init();
+        }
+        Err("no H.264 encoder available (tried h264_vaapi, h264_nvenc, h264_qsv, libx264)".into())
+    }
 
-            cfg.g_w               = width;
-            cfg.g_h               = height;
-            cfg.g_timebase.num    = 1;
-            cfg.g_timebase.den    = 90_000;   // 90 kHz RTP clock
-            cfg.rc_target_bitrate = bitrate_kbps;
-            cfg.g_threads         = 4;
-            cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
-            cfg.g_lag_in_frames   = 0;        // real-time; no look-ahead delay
-            cfg.rc_end_usage      = vpx_rc_mode_VPX_CBR;
-            cfg.kf_mode           = vpx_kf_mode_VPX_KF_AUTO;
-            cfg.kf_max_dist       = kf_frames as u32;
-            // Smaller RC buffers → encoder can't "save up" bits across seconds,
-            // which improves per-frame quality responsiveness for screen content.
-            cfg.rc_buf_sz         = 100;  // ms (default 1000)
-            cfg.rc_buf_initial_sz = 50;
-            cfg.rc_buf_optimal_sz = 100;
+    unsafe fn try_init(
+        codec_name: &str,
+        width: u32, height: u32,
+        bitrate_kbps: u32, fps: u32, kf_frames: u64,
+    ) -> Result<Self, String> {
+        let name_c = CString::new(codec_name).unwrap();
+        let codec   = sys::avcodec_find_encoder_by_name(name_c.as_ptr());
+        if codec.is_null() {
+            return Err("codec not found".into());
+        }
 
-            let mut ctx = MaybeUninit::<vpx_codec_ctx_t>::uninit();
-            let err = vpx_codec_enc_init_ver(
-                ctx.as_mut_ptr(),
-                iface,
-                &cfg,
+        let is_vaapi = codec_name == "h264_vaapi";
+
+        // ── VAAPI: create hardware device context ──────────────────────────────
+        let hw_device_ctx = if is_vaapi {
+            let mut ctx: *mut sys::AVBufferRef = ptr::null_mut();
+            let ret = sys::av_hwdevice_ctx_create(
+                &mut ctx,
+                sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                ptr::null(),
+                ptr::null_mut(),
                 0,
-                VPX_ENCODER_ABI_VERSION as i32,
             );
-            if err != vpx_codec_err_t_VPX_CODEC_OK {
-                return Err(format!("vpx_codec_enc_init_ver: {err}"));
+            if ret < 0 {
+                return Err(format!("VAAPI device create: {ret}"));
             }
-            let mut ctx = ctx.assume_init();
+            ctx
+        } else {
+            ptr::null_mut()
+        };
 
-            let image = vpx_img_alloc(
-                std::ptr::null_mut(),
-                vpx_img_fmt_VPX_IMG_FMT_I420,
-                width,
-                height,
-                1,
-            );
-            if image.is_null() {
-                return Err("vpx_img_alloc returned null".into());
+        let codec_ctx = sys::avcodec_alloc_context3(codec);
+        if codec_ctx.is_null() {
+            if !hw_device_ctx.is_null() {
+                let mut p = hw_device_ctx;
+                sys::av_buffer_unref(&mut p);
             }
-
-            // VP9 controls for real-time screen content.
-            vpx_codec_control_(&mut ctx, VP8E_SET_CPUUSED,           8i32);  // VP9 speed 0-9; 8 = real-time
-            vpx_codec_control_(&mut ctx, VP9E_SET_NOISE_SENSITIVITY, 0u32);  // disable denoiser — blurs text
-            vpx_codec_control_(&mut ctx, VP9E_SET_TILE_COLUMNS,      6i32);  // 2^6 tile columns for threading
-            vpx_codec_control_(&mut ctx, VP9E_SET_ROW_MT,            1u32);  // row-based multi-threading
-            vpx_codec_control_(&mut ctx, VP9E_SET_TUNE_CONTENT,      VP9E_CONTENT_SCREEN);
-
-            tracing::debug!("encoder init {width}x{height} {bitrate_kbps}kbps {fps}fps kf_every={kf_frames}");
-            let pts_per_frame = (90_000 / fps) as i64;
-            Ok(Self { ctx, cfg, image, pts: 0, pts_per_frame })
+            return Err("avcodec_alloc_context3 failed".into());
         }
+
+        (*codec_ctx).width        = width  as i32;
+        (*codec_ctx).height       = height as i32;
+        (*codec_ctx).time_base    = sys::AVRational { num: 1, den: 90_000 };
+        (*codec_ctx).framerate    = sys::AVRational { num: fps as i32, den: 1 };
+        (*codec_ctx).bit_rate     = (bitrate_kbps * 1_000) as i64;
+        (*codec_ctx).gop_size     = kf_frames as i32;
+        (*codec_ctx).max_b_frames = 0;
+        (*codec_ctx).pix_fmt      = if is_vaapi {
+            sys::AVPixelFormat::AV_PIX_FMT_VAAPI
+        } else {
+            sys::AVPixelFormat::AV_PIX_FMT_YUV420P
+        };
+
+        // ── VAAPI: hw_frames_ctx must be attached before avcodec_open2 ─────────
+        if is_vaapi {
+            let frames_buf = sys::av_hwframe_ctx_alloc(hw_device_ctx);
+            if frames_buf.is_null() {
+                sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+                let mut p = hw_device_ctx; sys::av_buffer_unref(&mut p);
+                return Err("av_hwframe_ctx_alloc failed".into());
+            }
+            {
+                let fctx = (*frames_buf).data as *mut sys::AVHWFramesContext;
+                (*fctx).format            = sys::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                (*fctx).sw_format         = sys::AVPixelFormat::AV_PIX_FMT_NV12;
+                (*fctx).width             = width  as i32;
+                (*fctx).height            = height as i32;
+                (*fctx).initial_pool_size = 4;
+            }
+            let ret = sys::av_hwframe_ctx_init(frames_buf);
+            if ret < 0 {
+                let mut p = frames_buf; sys::av_buffer_unref(&mut p);
+                sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+                let mut p = hw_device_ctx; sys::av_buffer_unref(&mut p);
+                return Err(format!("av_hwframe_ctx_init: {ret}"));
+            }
+            (*codec_ctx).hw_frames_ctx = sys::av_buffer_ref(frames_buf);
+            let mut p = frames_buf; sys::av_buffer_unref(&mut p);
+        }
+
+        // ── Codec-specific options via AVDictionary ────────────────────────────
+        let mut opts: *mut sys::AVDictionary = ptr::null_mut();
+        match codec_name {
+            "libx264" => {
+                sys::av_dict_set(&mut opts, b"preset\0".as_ptr() as _, b"ultrafast\0".as_ptr() as _, 0);
+                sys::av_dict_set(&mut opts, b"tune\0".as_ptr() as _,   b"zerolatency\0".as_ptr() as _, 0);
+            }
+            "h264_nvenc" => {
+                sys::av_dict_set(&mut opts, b"preset\0".as_ptr() as _,      b"p4\0".as_ptr() as _, 0);
+                sys::av_dict_set(&mut opts, b"rc\0".as_ptr() as _,          b"cbr\0".as_ptr() as _, 0);
+                sys::av_dict_set(&mut opts, b"zerolatency\0".as_ptr() as _, b"1\0".as_ptr() as _, 0);
+            }
+            _ => {}
+        }
+
+        let ret = sys::avcodec_open2(codec_ctx, codec, &mut opts);
+        sys::av_dict_free(&mut opts);
+        if ret < 0 {
+            sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+            if !hw_device_ctx.is_null() {
+                let mut p = hw_device_ctx; sys::av_buffer_unref(&mut p);
+            }
+            return Err(format!("avcodec_open2: {ret}"));
+        }
+
+        // ── CPU-side frame: swscale writes RGBA→YUV420P or RGBA→NV12 here ─────
+        let sw_pix_fmt = if is_vaapi {
+            sys::AVPixelFormat::AV_PIX_FMT_NV12
+        } else {
+            sys::AVPixelFormat::AV_PIX_FMT_YUV420P
+        };
+
+        let sw_frame = sys::av_frame_alloc();
+        if sw_frame.is_null() {
+            sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+            return Err("av_frame_alloc (sw) failed".into());
+        }
+        (*sw_frame).width  = width  as i32;
+        (*sw_frame).height = height as i32;
+        (*sw_frame).format = sw_pix_fmt as i32;
+        let ret = sys::av_frame_get_buffer(sw_frame, 0);
+        if ret < 0 {
+            sys::av_frame_free(&mut (sw_frame as *mut _));
+            sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+            return Err(format!("av_frame_get_buffer (sw): {ret}"));
+        }
+
+        // ── GPU frame (VAAPI only) ─────────────────────────────────────────────
+        let hw_frame = if is_vaapi {
+            let f = sys::av_frame_alloc();
+            if f.is_null() {
+                sys::av_frame_free(&mut (sw_frame as *mut _));
+                sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+                return Err("av_frame_alloc (hw) failed".into());
+            }
+            let ret = sys::av_hwframe_get_buffer((*codec_ctx).hw_frames_ctx, f, 0);
+            if ret < 0 {
+                sys::av_frame_free(&mut (f as *mut _));
+                sys::av_frame_free(&mut (sw_frame as *mut _));
+                sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+                return Err(format!("av_hwframe_get_buffer: {ret}"));
+            }
+            f
+        } else {
+            ptr::null_mut()
+        };
+
+        // ── swscale context: RGBA → YUV420P / NV12 ────────────────────────────
+        let sws_ctx = sys::sws_getContext(
+            width  as i32, height as i32, sys::AVPixelFormat::AV_PIX_FMT_RGBA,
+            width  as i32, height as i32, sw_pix_fmt,
+            sys::SWS_FAST_BILINEAR as i32,
+            ptr::null_mut(), ptr::null_mut(), ptr::null(),
+        );
+        if sws_ctx.is_null() {
+            if !hw_frame.is_null() { sys::av_frame_free(&mut (hw_frame as *mut _)); }
+            sys::av_frame_free(&mut (sw_frame as *mut _));
+            sys::avcodec_free_context(&mut (codec_ctx as *mut _));
+            if !hw_device_ctx.is_null() {
+                let mut p = hw_device_ctx; sys::av_buffer_unref(&mut p);
+            }
+            return Err("sws_getContext failed".into());
+        }
+
+        Ok(Self {
+            codec_ctx,
+            sws_ctx,
+            sw_frame,
+            hw_frame,
+            packet: sys::av_packet_alloc(),
+            pts: 0,
+            pts_per_frame: (90_000 / fps) as i64,
+            hw_device_ctx,
+        })
     }
 
-    /// Update the encoder's target bitrate without restarting it.
+    /// Update the encoder's target bitrate.
     pub fn set_bitrate(&mut self, kbps: u32) {
-        unsafe {
-            self.cfg.rc_target_bitrate = kbps;
-            let err = vpx_codec_enc_config_set(&mut self.ctx, &self.cfg);
-            if err != vpx_codec_err_t_VPX_CODEC_OK {
-                tracing::warn!("vpx_codec_enc_config_set: {err}");
-            } else {
-                tracing::debug!("encoder bitrate → {kbps} kbps");
-            }
-        }
+        unsafe { (*self.codec_ctx).bit_rate = (kbps * 1_000) as i64; }
+        tracing::debug!("encoder bitrate → {kbps} kbps");
     }
 
-    /// Encode one BGRA frame.
+    /// Encode one RGBA frame.
     ///
-    /// Returns `(vp9_bitstream, rtp_ts)` where `rtp_ts` is the 90 kHz presentation
-    /// timestamp used for this frame — pass it directly to [`Transport::send_video`].
-    pub fn encode(&mut self, bgra: &[u8], force_keyframe: bool) -> Option<(Vec<u8>, u32)> {
+    /// Returns `(h264_annex_b, rtp_ts)` where `rtp_ts` is the 90 kHz
+    /// presentation timestamp — pass it directly to [`Transport::send_video`].
+    pub fn encode(&mut self, rgba: &[u8], force_keyframe: bool) -> Option<(Vec<u8>, u32)> {
         unsafe {
-            self.fill_i420(bgra);
+            let w = (*self.sw_frame).width  as usize;
+            let h = (*self.sw_frame).height as usize;
+
+            // RGBA → YUV420P / NV12 via swscale (SIMD-optimised)
+            let src_data:   [*const u8; 8] = [
+                rgba.as_ptr(), ptr::null(), ptr::null(), ptr::null(),
+                ptr::null(), ptr::null(), ptr::null(), ptr::null(),
+            ];
+            let src_stride: [i32; 8] = [w as i32 * 4, 0, 0, 0, 0, 0, 0, 0];
+            sys::sws_scale(
+                self.sws_ctx,
+                src_data.as_ptr(),
+                src_stride.as_ptr(),
+                0, h as i32,
+                (*self.sw_frame).data.as_ptr() as *const *mut u8,
+                (*self.sw_frame).linesize.as_ptr(),
+            );
 
             let pts_used = self.pts;
-            let flags    = if force_keyframe { VPX_EFLAG_FORCE_KF as _ } else { 0 };
-
-            let err = vpx_codec_encode(
-                &mut self.ctx,
-                self.image,
-                pts_used,
-                1,
-                flags,
-                VPX_DL_REALTIME as _,
-            );
             self.pts += self.pts_per_frame;
 
-            if err != vpx_codec_err_t_VPX_CODEC_OK {
-                tracing::warn!("vpx_codec_encode: {err}");
+            (*self.sw_frame).pts       = pts_used;
+            (*self.sw_frame).pict_type = if force_keyframe {
+                sys::AVPictureType::AV_PICTURE_TYPE_I
+            } else {
+                sys::AVPictureType::AV_PICTURE_TYPE_NONE
+            };
+
+            // For VAAPI: upload CPU NV12 → GPU surface
+            let enc_frame = if !self.hw_frame.is_null() {
+                (*self.hw_frame).pts       = pts_used;
+                (*self.hw_frame).pict_type = (*self.sw_frame).pict_type;
+                let ret = sys::av_hwframe_transfer_data(self.hw_frame, self.sw_frame, 0);
+                if ret < 0 {
+                    tracing::warn!("av_hwframe_transfer_data: {ret}");
+                    return None;
+                }
+                self.hw_frame
+            } else {
+                self.sw_frame
+            };
+
+            let ret = sys::avcodec_send_frame(self.codec_ctx, enc_frame);
+            if ret < 0 {
+                tracing::warn!("avcodec_send_frame: {ret}");
                 return None;
             }
 
-            let mut iter: vpx_codec_iter_t = std::ptr::null();
             let mut out = Vec::<u8>::new();
-
             loop {
-                let pkt = vpx_codec_get_cx_data(&mut self.ctx, &mut iter);
-                if pkt.is_null() { break; }
-                if (*pkt).kind == vpx_codec_cx_pkt_kind_VPX_CODEC_CX_FRAME_PKT {
-                    let buf = (*pkt).data.frame.buf as *const u8;
-                    let sz  = (*pkt).data.frame.sz;
-                    out.extend_from_slice(std::slice::from_raw_parts(buf, sz));
-                }
+                sys::av_packet_unref(self.packet);
+                let ret = sys::avcodec_receive_packet(self.codec_ctx, self.packet);
+                if ret < 0 { break; }
+                let data = std::slice::from_raw_parts(
+                    (*self.packet).data,
+                    (*self.packet).size as usize,
+                );
+                out.extend_from_slice(data);
             }
 
             if out.is_empty() { None } else { Some((out, pts_used as u32)) }
         }
     }
-
-    /// Convert a BGRA frame into the I420 planar layout expected by libvpx.
-    /// Uses BT.601 limited-range coefficients (the standard for SD/desktop video).
-    unsafe fn fill_i420(&mut self, bgra: &[u8]) {
-        let img = &*self.image;
-        let w = img.d_w as usize;
-        let h = img.d_h as usize;
-
-        let y_stride = img.stride[0] as usize;
-        let u_stride = img.stride[1] as usize;
-        let v_stride = img.stride[2] as usize;
-        let y_plane  = img.planes[0];
-        let u_plane  = img.planes[1];
-        let v_plane  = img.planes[2];
-
-        for row in 0..h {
-            for col in 0..w {
-                let src = (row * w + col) * 4;
-                let b = bgra[src]     as i32;
-                let g = bgra[src + 1] as i32;
-                let r = bgra[src + 2] as i32;
-
-                let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                *y_plane.add(row * y_stride + col) = y.clamp(16, 235) as u8;
-
-                // U and V are subsampled 2×2 — only written for every other row/col.
-                if row % 2 == 0 && col % 2 == 0 {
-                    let ur = row / 2;
-                    let uc = col / 2;
-                    let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                    let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                    *u_plane.add(ur * u_stride + uc) = u.clamp(16, 240) as u8;
-                    *v_plane.add(ur * v_stride + uc) = v.clamp(16, 240) as u8;
-                }
-            }
-        }
-    }
 }
 
-impl Drop for Vp9Encoder {
+impl Drop for H264Encoder {
     fn drop(&mut self) {
         unsafe {
-            vpx_codec_destroy(&mut self.ctx);
-            if !self.image.is_null() {
-                vpx_img_free(self.image);
-            }
+            if !self.hw_frame.is_null()      { sys::av_frame_free(&mut self.hw_frame); }
+            if !self.sw_frame.is_null()      { sys::av_frame_free(&mut self.sw_frame); }
+            if !self.sws_ctx.is_null()       { sys::sws_freeContext(self.sws_ctx); self.sws_ctx = ptr::null_mut(); }
+            if !self.packet.is_null()        { sys::av_packet_free(&mut self.packet); }
+            if !self.codec_ctx.is_null()     { sys::avcodec_free_context(&mut self.codec_ctx); }
+            if !self.hw_device_ctx.is_null() { sys::av_buffer_unref(&mut self.hw_device_ctx); }
         }
     }
 }

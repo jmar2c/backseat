@@ -1,5 +1,11 @@
 # Rust
 /target
+
+# Cross-compiled FFmpeg for Windows (built by scripts/cross-windows.sh)
+/build/
+
+# Pre-built FFmpeg dev package (downloaded by scripts/setup-ffmpeg.ps1 on Windows)
+/vendor/
 **/*.rs.bk
 Cargo.lock
 

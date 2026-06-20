@@ -18,26 +18,52 @@ Real-time P2P screen sharing with viewer annotations.
 
 ---
 
-## Requirements
+## Build from source
 
-**Linux:** `libvpx7` and `libdbus-1` must be present. `libdbus-1` is pre-installed on most desktops; `libvpx7` may not be:
+### Linux
+
+**1. Install system dependencies (once per machine):**
 
 ```bash
-sudo apt install libvpx7
+./scripts/setup-ffmpeg.sh
 ```
 
-**Windows:** [Visual C++ Redistributable 2015–2022](https://aka.ms/vs/17/release/vc_redist.x64.exe) must be installed.
+This installs the required apt packages (`libdbus-1-dev`, `libopus-dev`, `libasound2-dev`, `nasm`, `libva-dev`, `libx264-dev`, `mingw-w64`) and adds the Windows cross-compile target to rustup.
 
-### Build from source
-
-**System dependencies (Linux):**
+**2. Build:**
 
 ```bash
-sudo apt install libdbus-1-dev   # system tray (ksni)
-sudo apt install libvpx-dev      # VP8 encoder/decoder
+cargo build -p overlay            # debug
+cargo build --release -p overlay  # release
 ```
 
+The first build compiles FFmpeg 7.1 and libx264 from source (~10 minutes). Subsequent builds are fast — Cargo caches the compiled output in `target/`.
+
+### Windows (cross-compile from Linux)
+
+After running `setup-ffmpeg.sh`:
+
 ```bash
+./scripts/cross-windows.sh             # debug
+./scripts/cross-windows.sh --release   # release
+```
+
+Output: `target/x86_64-pc-windows-gnu/{debug,release}/overlay.exe`
+
+The first run clones and compiles FFmpeg + x264 for Windows (~10 minutes). Subsequent runs are fast. The resulting `.exe` is fully self-contained — no redistributable or runtime DLL is required on the target machine.
+
+### Windows (native)
+
+Run the setup script from the repo root (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-ffmpeg.ps1
+```
+
+Then open a new terminal and:
+
+```powershell
+cargo build -p overlay
 cargo build --release -p overlay
 ```
 
