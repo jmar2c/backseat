@@ -1120,10 +1120,10 @@ impl OverlayApp {
                                 }
                                 let keyframe = n % kf_frames == 0
                                     || keyframe_req.swap(false, Ordering::Relaxed);
-                                if let Some((data, pts)) = enc.encode(&rgba, keyframe) {
+                                if let Some((data, pts, is_idr)) = enc.encode(&rgba, keyframe) {
                                     if n == 0 { tracing::debug!("first encoded frame {} bytes", data.len()); }
-                                    if keyframe { tracing::trace!("encode keyframe {n} pts={pts} → {} bytes", data.len()); }
-                                    let _ = tx.send(Arc::new(EncodedFrame { data, pts, keyframe }));
+                                    if is_idr { tracing::trace!("encode IDR {n} pts={pts} → {} bytes", data.len()); }
+                                    let _ = tx.send(Arc::new(EncodedFrame { data, pts, keyframe: is_idr }));
                                 } else if keyframe {
                                     tracing::warn!("encode returned None at frame {n}");
                                 }

@@ -19,6 +19,9 @@ pub struct H264Encoder {
     pts_per_frame: i64,
     /// Kept alive for the lifetime of the VAAPI encoder; null otherwise.
     hw_device_ctx: *mut sys::AVBufferRef,
+    /// Cached SPS+PPS NAL units from the first keyframe; prepended to any
+    /// subsequent IDR frame that the encoder emits without parameter sets.
+    sps_pps:       Vec<u8>,
 }
 
 // SAFETY: only ever used from a single OS thread (the capture thread).
@@ -96,6 +99,12 @@ impl H264Encoder {
         (*codec_ctx).bit_rate     = (bitrate_kbps * 1_000) as i64;
         (*codec_ctx).gop_size     = kf_frames as i32;
         (*codec_ctx).max_b_frames = 0;
+        // CLOSED_GOP makes every forced keyframe (AV_PICTURE_TYPE_I) a true IDR
+        // (NAL type 5) rather than a non-IDR I-slice (NAL type 1).  Without this,
+        // the libx264 wrapper only emits IDRs for gop_size-scheduled keyframes;
+        // on-demand keyframes come out as non-IDR I-frames that the viewer cannot
+        // bootstrap decode from.
+        (*codec_ctx).flags |= sys::AV_CODEC_FLAG_CLOSED_GOP as i32;
         (*codec_ctx).pix_fmt      = if is_vaapi {
             sys::AVPixelFormat::AV_PIX_FMT_VAAPI
         } else {
@@ -224,6 +233,7 @@ impl H264Encoder {
             pts: 0,
             pts_per_frame: (90_000 / fps) as i64,
             hw_device_ctx,
+            sps_pps: Vec::new(),
         })
     }
 
@@ -237,7 +247,11 @@ impl H264Encoder {
     ///
     /// Returns `(h264_annex_b, rtp_ts)` where `rtp_ts` is the 90 kHz
     /// presentation timestamp — pass it directly to [`Transport::send_video`].
-    pub fn encode(&mut self, rgba: &[u8], force_keyframe: bool) -> Option<(Vec<u8>, u32)> {
+    /// Returns `(h264_annex_b, rtp_ts, is_idr)`.  `is_idr` is true only when
+    /// the encoder emitted an actual IDR frame (AV_PKT_FLAG_KEY set on the
+    /// packet).  Callers should use this — not the `force_keyframe` input — to
+    /// decide whether to mark the transmitted frame as a keyframe.
+    pub fn encode(&mut self, rgba: &[u8], force_keyframe: bool) -> Option<(Vec<u8>, u32, bool)> {
         unsafe {
             let w = (*self.sw_frame).width  as usize;
             let h = (*self.sw_frame).height as usize;
@@ -288,10 +302,14 @@ impl H264Encoder {
             }
 
             let mut out = Vec::<u8>::new();
+            let mut got_keyframe_pkt = false;
             loop {
                 sys::av_packet_unref(self.packet);
                 let ret = sys::avcodec_receive_packet(self.codec_ctx, self.packet);
                 if ret < 0 { break; }
+                if (*self.packet).flags & sys::AV_PKT_FLAG_KEY as i32 != 0 {
+                    got_keyframe_pkt = true;
+                }
                 let data = std::slice::from_raw_parts(
                     (*self.packet).data,
                     (*self.packet).size as usize,
@@ -299,7 +317,25 @@ impl H264Encoder {
                 out.extend_from_slice(data);
             }
 
-            if out.is_empty() { None } else { Some((out, pts_used as u32)) }
+            // Ensure every IDR frame is self-contained with SPS+PPS so that
+            // viewers joining mid-stream can decode without missing the initial
+            // parameter sets.
+            if got_keyframe_pkt && !out.is_empty() {
+                let off = idr_start_offset(&out);
+                if off > 0 && off < out.len() {
+                    // IDR is preceded by SPS+PPS — refresh the cache.
+                    self.sps_pps = out[..off].to_vec();
+                } else if off == 0 && !self.sps_pps.is_empty() {
+                    // IDR at byte 0 without SPS+PPS — prepend from cache.
+                    let mut prefixed = self.sps_pps.clone();
+                    prefixed.extend_from_slice(&out);
+                    out = prefixed;
+                }
+                // off == out.len(): idr_start_offset found no IDR NAL; shouldn't
+                // reach here when got_keyframe_pkt is true.
+            }
+
+            if out.is_empty() { None } else { Some((out, pts_used as u32, got_keyframe_pkt)) }
         }
     }
 }
@@ -315,4 +351,27 @@ impl Drop for H264Encoder {
             if !self.hw_device_ctx.is_null() { sys::av_buffer_unref(&mut self.hw_device_ctx); }
         }
     }
+}
+
+/// Scan an Annex B bitstream for the first IDR slice NAL (type 5) and return
+/// its start-code offset.  Everything before that offset is SPS+PPS header
+/// material.  Returns `data.len()` when no IDR is found (non-keyframe output).
+fn idr_start_offset(data: &[u8]) -> usize {
+    let mut i = 0;
+    while i < data.len() {
+        let (start, sc_len) = if data.get(i..i + 4) == Some(&[0, 0, 0, 1]) {
+            (i, 4usize)
+        } else if data.get(i..i + 3) == Some(&[0, 0, 1]) {
+            (i, 3usize)
+        } else {
+            i += 1;
+            continue;
+        };
+        let nalu = start + sc_len;
+        if nalu < data.len() && data[nalu] & 0x1F == 5 {
+            return start;
+        }
+        i = nalu + 1;
+    }
+    data.len()
 }
