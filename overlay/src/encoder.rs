@@ -131,6 +131,8 @@ impl H264Encoder {
 
         // ── Codec-specific options via AVDictionary ────────────────────────────
         let mut opts: *mut sys::AVDictionary = ptr::null_mut();
+        // Prepend SPS+PPS to every IDR frame so viewers who join mid-stream can decode.
+        sys::av_dict_set(&mut opts, b"repeat_headers\0".as_ptr() as _, b"1\0".as_ptr() as _, 0);
         match codec_name {
             "libx264" => {
                 sys::av_dict_set(&mut opts, b"preset\0".as_ptr() as _, b"ultrafast\0".as_ptr() as _, 0);
