@@ -8,20 +8,24 @@ use std::ptr;
 /// NVENC/QSV on Windows) and falls back to libx264 if none are available.
 /// Lives on its own OS thread because AVCodecContext is not Sync.
 pub struct H264Encoder {
-    codec_ctx:     *mut sys::AVCodecContext,
-    sws_ctx:       *mut sys::SwsContext,
+    codec_ctx:            *mut sys::AVCodecContext,
+    sws_ctx:              *mut sys::SwsContext,
     /// CPU-side frame: RGBA is scaled into this (YUV420P or NV12).
-    sw_frame:      *mut sys::AVFrame,
+    sw_frame:             *mut sys::AVFrame,
     /// GPU-side frame used only for VAAPI; null for software encoders.
-    hw_frame:      *mut sys::AVFrame,
-    packet:        *mut sys::AVPacket,
-    pts:           i64,
-    pts_per_frame: i64,
+    hw_frame:             *mut sys::AVFrame,
+    packet:               *mut sys::AVPacket,
+    pts:                  i64,
+    pts_per_frame:        i64,
     /// Kept alive for the lifetime of the VAAPI encoder; null otherwise.
-    hw_device_ctx: *mut sys::AVBufferRef,
-    /// Cached SPS+PPS NAL units from the first keyframe; prepended to any
-    /// subsequent IDR frame that the encoder emits without parameter sets.
-    sps_pps:       Vec<u8>,
+    hw_device_ctx:        *mut sys::AVBufferRef,
+    /// Cached SPS+PPS NAL units (Annex B); prepended to any IDR frame that
+    /// the encoder emits without parameter sets.  Pre-populated from
+    /// codec_ctx extradata for hardware encoders that store SPS/PPS there.
+    sps_pps:              Vec<u8>,
+    /// Byte-count of the length-prefix field in AVCC frames (1, 2, or 4).
+    /// 4 for all hardware encoders in practice; read from AVCC extradata.
+    avcc_nal_length_size: u8,
 }
 
 // SAFETY: only ever used from a single OS thread (the capture thread).
@@ -224,6 +228,27 @@ impl H264Encoder {
             return Err("sws_getContext failed".into());
         }
 
+        // Some hardware encoders (NVENC, QSV, AMF on Windows) store SPS/PPS in
+        // extradata rather than prepending to keyframe packets.  Extract them
+        // now so the sps_pps cache is ready before the first keyframe arrives.
+        let (initial_sps_pps, avcc_nal_length_size) =
+            if !(*codec_ctx).extradata.is_null() && (*codec_ctx).extradata_size > 0 {
+                let extra = std::slice::from_raw_parts(
+                    (*codec_ctx).extradata,
+                    (*codec_ctx).extradata_size as usize,
+                );
+                if is_annexb(extra) {
+                    (extra.to_vec(), 4u8)
+                } else if let Some((annexb, nal_len_size)) = parse_avcc_extradata(extra) {
+                    tracing::debug!("{codec_name} extradata is AVCC; extracted SPS+PPS ({} bytes, nal_len_size={nal_len_size})", annexb.len());
+                    (annexb, nal_len_size)
+                } else {
+                    (Vec::new(), 4u8)
+                }
+            } else {
+                (Vec::new(), 4u8)
+            };
+
         Ok(Self {
             codec_ctx,
             sws_ctx,
@@ -233,7 +258,8 @@ impl H264Encoder {
             pts: 0,
             pts_per_frame: (90_000 / fps) as i64,
             hw_device_ctx,
-            sps_pps: Vec::new(),
+            sps_pps: initial_sps_pps,
+            avcc_nal_length_size,
         })
     }
 
@@ -314,7 +340,12 @@ impl H264Encoder {
                     (*self.packet).data,
                     (*self.packet).size as usize,
                 );
-                out.extend_from_slice(data);
+                if is_annexb(data) {
+                    out.extend_from_slice(data);
+                } else {
+                    // Hardware encoder output is AVCC (length-prefixed); convert to Annex B.
+                    out.extend_from_slice(&avcc_to_annexb(data, self.avcc_nal_length_size));
+                }
             }
 
             // Ensure every IDR frame is self-contained with SPS+PPS so that
@@ -351,6 +382,62 @@ impl Drop for H264Encoder {
             if !self.hw_device_ctx.is_null() { sys::av_buffer_unref(&mut self.hw_device_ctx); }
         }
     }
+}
+
+fn is_annexb(data: &[u8]) -> bool {
+    data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1])
+}
+
+/// Parse an AVCDecoderConfigurationRecord (AVCC extradata) into Annex B SPS+PPS bytes.
+/// Returns `(annexb_bytes, nal_length_size)`, where `nal_length_size` is the number
+/// of bytes used for NALU length prefixes in AVCC-encoded frames (1, 2, or 4).
+fn parse_avcc_extradata(data: &[u8]) -> Option<(Vec<u8>, u8)> {
+    if data.len() < 7 || data[0] != 1 { return None; }
+    let nal_length_size = (data[4] & 0x03) + 1;
+    let mut out = Vec::new();
+    let num_sps = (data[5] & 0x1F) as usize;
+    let mut pos = 6;
+    for _ in 0..num_sps {
+        if pos + 2 > data.len() { return None; }
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > data.len() { return None; }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&data[pos..pos + len]);
+        pos += len;
+    }
+    if pos >= data.len() { return None; }
+    let num_pps = data[pos] as usize;
+    pos += 1;
+    for _ in 0..num_pps {
+        if pos + 2 > data.len() { return None; }
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > data.len() { return None; }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&data[pos..pos + len]);
+        pos += len;
+    }
+    Some((out, nal_length_size))
+}
+
+/// Convert AVCC length-prefixed NALUs into Annex B start-code format.
+fn avcc_to_annexb(data: &[u8], nal_length_size: u8) -> Vec<u8> {
+    let ls = nal_length_size as usize;
+    let mut out = Vec::with_capacity(data.len() + 32);
+    let mut i = 0;
+    while i + ls <= data.len() {
+        let mut nal_len = 0usize;
+        for b in &data[i..i + ls] {
+            nal_len = (nal_len << 8) | *b as usize;
+        }
+        i += ls;
+        if nal_len == 0 || i + nal_len > data.len() { break; }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&data[i..i + nal_len]);
+        i += nal_len;
+    }
+    out
 }
 
 /// Scan an Annex B bitstream for the first IDR slice NAL (type 5) and return
