@@ -26,6 +26,9 @@ pub struct H264Encoder {
     /// Byte-count of the length-prefix field in AVCC frames (1, 2, or 4).
     /// 4 for all hardware encoders in practice; read from AVCC extradata.
     avcc_nal_length_size: u8,
+    /// True when the encoder outputs AVCC (length-prefixed) packets instead
+    /// of Annex B (start-code) packets.  Detected once from codec extradata.
+    avcc_output:          bool,
 }
 
 // SAFETY: only ever used from a single OS thread (the capture thread).
@@ -229,24 +232,29 @@ impl H264Encoder {
         }
 
         // Some hardware encoders (NVENC, QSV, AMF on Windows) store SPS/PPS in
-        // extradata rather than prepending to keyframe packets.  Extract them
-        // now so the sps_pps cache is ready before the first keyframe arrives.
-        let (initial_sps_pps, avcc_nal_length_size) =
+        // extradata in AVCC format and emit AVCC-framed packets.  Detect the
+        // output format once here so we never have to guess per-packet.
+        // AVCC extradata starts with configurationVersion=1 (byte 0x01); Annex B
+        // extradata starts with a start code (0x00 0x00 ...).
+        let (initial_sps_pps, avcc_nal_length_size, avcc_output) =
             if !(*codec_ctx).extradata.is_null() && (*codec_ctx).extradata_size > 0 {
                 let extra = std::slice::from_raw_parts(
                     (*codec_ctx).extradata,
                     (*codec_ctx).extradata_size as usize,
                 );
-                if is_annexb(extra) {
-                    (extra.to_vec(), 4u8)
+                if extra.starts_with(&[0, 0, 0, 1]) || extra.starts_with(&[0, 0, 1]) {
+                    // Annex B extradata — encoder writes Annex B packets.
+                    (extra.to_vec(), 4u8, false)
                 } else if let Some((annexb, nal_len_size)) = parse_avcc_extradata(extra) {
                     tracing::debug!("{codec_name} extradata is AVCC; extracted SPS+PPS ({} bytes, nal_len_size={nal_len_size})", annexb.len());
-                    (annexb, nal_len_size)
+                    (annexb, nal_len_size, true)
                 } else {
-                    (Vec::new(), 4u8)
+                    // Unrecognised extradata format; assume Annex B.
+                    (Vec::new(), 4u8, false)
                 }
             } else {
-                (Vec::new(), 4u8)
+                // No extradata → libx264 or similar, always Annex B.
+                (Vec::new(), 4u8, false)
             };
 
         Ok(Self {
@@ -260,6 +268,7 @@ impl H264Encoder {
             hw_device_ctx,
             sps_pps: initial_sps_pps,
             avcc_nal_length_size,
+            avcc_output,
         })
     }
 
@@ -340,11 +349,10 @@ impl H264Encoder {
                     (*self.packet).data,
                     (*self.packet).size as usize,
                 );
-                if is_annexb(data) {
-                    out.extend_from_slice(data);
-                } else {
-                    // Hardware encoder output is AVCC (length-prefixed); convert to Annex B.
+                if self.avcc_output {
                     out.extend_from_slice(&avcc_to_annexb(data, self.avcc_nal_length_size));
+                } else {
+                    out.extend_from_slice(data);
                 }
             }
 
@@ -382,10 +390,6 @@ impl Drop for H264Encoder {
             if !self.hw_device_ctx.is_null() { sys::av_buffer_unref(&mut self.hw_device_ctx); }
         }
     }
-}
-
-fn is_annexb(data: &[u8]) -> bool {
-    data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1])
 }
 
 /// Parse an AVCDecoderConfigurationRecord (AVCC extradata) into Annex B SPS+PPS bytes.

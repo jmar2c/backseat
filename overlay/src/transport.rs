@@ -74,7 +74,7 @@ pub enum Packet {
     },
     Annot(String),
     Disconnect,
-    Audio { seq: u16, rtp_ts: u32, data: Vec<u8> },
+    Audio { _seq: u16, rtp_ts: u32, data: Vec<u8> },
     Sync  { video_ts: u32, audio_ts: u32, ntp_ms: u64 },
     // ── Sticker image transfer ──────────────────────────────────────────────
     /// One fragment of a sticker image with a CRC32 for per-chunk integrity.
@@ -89,7 +89,7 @@ pub enum Packet {
     /// Host → viewer: echo of the Ping timestamp for RTT calculation.
     Pong { sent_ms: u64 },
     /// Viewer → host: network statistics used by the ABR loop.
-    Stats { loss_pct: f32, ping_ms: f32 },  // ping_ms reserved for future use
+    Stats { loss_pct: f32, _ping_ms: f32 },  // reserved for future use
 }
 
 fn gen_ssrc() -> u32 {
@@ -265,7 +265,7 @@ impl Transport {
             PKT_AUDIO if data.len() > 13 => {
                 let seq    = u16::from_be_bytes([data[3], data[4]]);
                 let rtp_ts = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
-                Packet::Audio { seq, rtp_ts, data: data[13..].to_vec() }
+                Packet::Audio { _seq: seq, rtp_ts, data: data[13..].to_vec() }
             }
 
             // Layout: [0x06][video_ts:4][audio_ts:4][ntp_ms:8]
@@ -328,7 +328,7 @@ impl Transport {
             PKT_STATS if data.len() == 9 => {
                 let loss_pct = f32::from_be_bytes(data[1..5].try_into().ok()?);
                 let ping_ms  = f32::from_be_bytes(data[5..9].try_into().ok()?);
-                Packet::Stats { loss_pct, ping_ms }
+                Packet::Stats { loss_pct, _ping_ms: ping_ms }
             }
 
             _ => return None,

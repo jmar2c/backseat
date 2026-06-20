@@ -1304,7 +1304,7 @@ impl OverlayApp {
                                                 let _ = transport.send_pong(src, sent_ms).await;
                                             }
                                         }
-                                        Packet::Stats { loss_pct, ping_ms: _ } => {
+                                        Packet::Stats { loss_pct, .. } => {
                                             if peers.contains_key(&src) {
                                                 *viewer_loss.lock().unwrap() = loss_pct;
                                                 tracing::trace!("abr: viewer {src} loss={loss_pct:.1}%");

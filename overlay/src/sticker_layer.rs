@@ -118,10 +118,6 @@ impl StickerReassembler {
             .collect()
     }
 
-    pub fn remove(&mut self, sticker_id: u64) {
-        self.pending.remove(&sticker_id);
-    }
-
     pub fn remove_by_owner(&mut self, viewer_id: Uuid) {
         self.pending.retain(|_, p| p.owner != viewer_id);
     }
