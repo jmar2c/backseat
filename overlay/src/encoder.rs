@@ -356,25 +356,28 @@ impl H264Encoder {
                 }
             }
 
+            // Detect keyframes from the bitstream (IDR NAL type 5) in addition to
+            // AV_PKT_FLAG_KEY.  Some hardware encoders (NVENC/QSV on Windows) don't
+            // set AV_PKT_FLAG_KEY reliably even when they emit IDR frames.
+            let idr_off = if out.is_empty() { 0 } else { idr_start_offset(&out) };
+            let is_keyframe = got_keyframe_pkt || (!out.is_empty() && idr_off < out.len());
+
             // Ensure every IDR frame is self-contained with SPS+PPS so that
             // viewers joining mid-stream can decode without missing the initial
             // parameter sets.
-            if got_keyframe_pkt && !out.is_empty() {
-                let off = idr_start_offset(&out);
-                if off > 0 && off < out.len() {
-                    // IDR is preceded by SPS+PPS — refresh the cache.
-                    self.sps_pps = out[..off].to_vec();
-                } else if off == 0 && !self.sps_pps.is_empty() {
+            if is_keyframe && !out.is_empty() {
+                if idr_off > 0 && idr_off < out.len() {
+                    // IDR is preceded by SPS+PPS in the bitstream — refresh the cache.
+                    self.sps_pps = out[..idr_off].to_vec();
+                } else if idr_off == 0 && !self.sps_pps.is_empty() {
                     // IDR at byte 0 without SPS+PPS — prepend from cache.
                     let mut prefixed = self.sps_pps.clone();
                     prefixed.extend_from_slice(&out);
                     out = prefixed;
                 }
-                // off == out.len(): idr_start_offset found no IDR NAL; shouldn't
-                // reach here when got_keyframe_pkt is true.
             }
 
-            if out.is_empty() { None } else { Some((out, pts_used as u32, got_keyframe_pkt)) }
+            if out.is_empty() { None } else { Some((out, pts_used as u32, is_keyframe)) }
         }
     }
 }
