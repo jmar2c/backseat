@@ -176,7 +176,7 @@ impl Transport {
             // Fragmentation metadata
             pkt.extend_from_slice(&(i as u16).to_be_bytes()); // idx
             pkt.extend_from_slice(&total.to_be_bytes());
-            pkt.push(if keyframe && i == 0 { 0x01 } else { 0x00 }); // flags
+            pkt.push(if keyframe { 0x01 } else { 0x00 }); // flags: set on every fragment of a keyframe
             pkt.extend_from_slice(chunk);
             self.socket.send_to(&pkt, to).await?;
         }
@@ -450,8 +450,9 @@ impl Reassembler {
         self.frames.retain(|id, _| rtp_ts.wrapping_sub(*id) <= 180_000);
 
         let entry = self.frames.entry(rtp_ts).or_insert(PendingFrame {
-            frags: HashMap::new(), total: frag_total, keyframe,
+            frags: HashMap::new(), total: frag_total, keyframe: false,
         });
+        entry.keyframe |= keyframe; // any fragment of a keyframe can carry the flag
         entry.frags.insert(frag_idx, data);
 
         if entry.frags.len() == entry.total as usize {
