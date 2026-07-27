@@ -96,7 +96,7 @@ impl QualityPreset {
 
 struct RgbaFrame { width: u32, height: u32, data: Vec<u8> }
 
-/// Encoded VP8 frame plus the 90 kHz RTP timestamp used to encode it.
+/// Encoded H.264 frame plus the 90 kHz RTP timestamp used to encode it.
 struct EncodedFrame {
     data:     Vec<u8>,
     pts:      u32,
@@ -1082,7 +1082,7 @@ impl OverlayApp {
                     None
                 };
 
-            // Screen capture + VP8 encode thread.
+            // Screen capture + H.264 encode thread.
             {
                 let tx           = frame_tx.clone();
                 let capture_ok   = Arc::clone(&capture_ok);
@@ -1509,7 +1509,7 @@ impl OverlayApp {
                     Err(e) => { tracing::warn!("audio player unavailable: {e}"); None }
                 };
 
-            // VP9 decode thread.
+            // H.264 decode thread.
             std::thread::spawn(move || {
                 let mut dec = match H264Decoder::new() {
                     Ok(d)  => d,
@@ -1517,14 +1517,16 @@ impl OverlayApp {
                 };
                 tracing::debug!("decode thread started");
                 let mut decoded_count = 0u64;
+                let mut received_count = 0u64;
                 while let Ok(data) = frame_sync_rx.recv() {
+                    received_count += 1;
                     tracing::trace!("decode thread got {} bytes", data.len());
                     if let Some((w, h, pixels)) = dec.decode(&data) {
                         if decoded_count == 0 { tracing::debug!("first decoded frame {w}x{h}"); }
                         decoded_count += 1;
                         let _ = rgba_tx.send(RgbaFrame { width: w, height: h, data: pixels });
                     } else {
-                        tracing::warn!("decode returned None for {} bytes", data.len());
+                        tracing::warn!("decode returned None for {} bytes (frame #{received_count})", data.len());
                     }
                 }
                 tracing::debug!("decode thread exiting");
@@ -1637,9 +1639,12 @@ impl OverlayApp {
                                                 if let Some((frame, is_kf)) = reassembler.push(rtp_ts, frag_idx, frag_total, keyframe, data) {
                                                     if is_kf { got_keyframe = true; }
                                                     if got_keyframe {
-                                                        tracing::trace!("reassembled frame rtp_ts={rtp_ts} ({} bytes)", frame.len());
+                                                        tracing::trace!("reassembled frame rtp_ts={rtp_ts} is_kf={is_kf} ({} bytes)", frame.len());
                                                         if frame_sync_tx.try_send(frame).is_err() {
                                                             tracing::debug!("decode thread busy — dropped frame rtp_ts={rtp_ts}");
+                                                            // If the dropped frame was a keyframe, reset so we wait
+                                                            // for the next IDR instead of sending undecodable P-frames.
+                                                            if is_kf { got_keyframe = false; }
                                                         }
                                                     } else {
                                                         tracing::debug!("dropping P-frame rtp_ts={rtp_ts} before first keyframe");

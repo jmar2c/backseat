@@ -36,7 +36,9 @@ fn main() {
     .unwrap();
 }
 
-#[cfg(debug_assertions)]
+// On Windows there is no attached console, so all builds write to a log file.
+// On other platforms, debug builds write to stdout; release builds write to a file.
+#[cfg(all(debug_assertions, not(target_os = "windows")))]
 fn init_logging() {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::registry()
@@ -48,10 +50,10 @@ fn init_logging() {
         .init();
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(any(not(debug_assertions), target_os = "windows"))]
 fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    let log_dir = release_log_dir();
+    let log_dir = log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let appender = tracing_appender::rolling::never(&log_dir, "backseat.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
@@ -65,8 +67,8 @@ fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
     guard
 }
 
-#[cfg(not(debug_assertions))]
-fn release_log_dir() -> std::path::PathBuf {
+#[allow(dead_code)]
+fn log_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
         std::env::var("APPDATA")

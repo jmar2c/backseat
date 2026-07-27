@@ -158,6 +158,9 @@ impl H264Encoder {
                 sys::av_dict_set(&mut opts, b"preset\0".as_ptr() as _,      b"p4\0".as_ptr() as _, 0);
                 sys::av_dict_set(&mut opts, b"rc\0".as_ptr() as _,          b"cbr\0".as_ptr() as _, 0);
                 sys::av_dict_set(&mut opts, b"zerolatency\0".as_ptr() as _, b"1\0".as_ptr() as _, 0);
+                // Without forced-idr, NVENC ignores AV_PICTURE_TYPE_I entirely and
+                // never emits IDR NAL units — even on explicit force_keyframe calls.
+                sys::av_dict_set(&mut opts, b"forced-idr\0".as_ptr() as _,  b"1\0".as_ptr() as _, 0);
             }
             _ => {}
         }
@@ -362,6 +365,15 @@ impl H264Encoder {
             let idr_off = if out.is_empty() { 0 } else { idr_start_offset(&out) };
             let is_keyframe = got_keyframe_pkt || (!out.is_empty() && idr_off < out.len());
 
+            if force_keyframe && !is_keyframe && !out.is_empty() {
+                // Encoder ignored the forced keyframe request.  Log NAL types to help diagnose.
+                tracing::warn!(
+                    "forced keyframe produced no IDR (pkt_flag_key={got_keyframe_pkt} {} bytes); NAL types: {}",
+                    out.len(),
+                    nal_type_summary(&out),
+                );
+            }
+
             // Ensure every IDR frame is self-contained with SPS+PPS so that
             // viewers joining mid-stream can decode without missing the initial
             // parameter sets.
@@ -445,6 +457,38 @@ fn avcc_to_annexb(data: &[u8], nal_length_size: u8) -> Vec<u8> {
         i += nal_len;
     }
     out
+}
+
+/// Return a compact string listing every NAL unit type found in an Annex B bitstream.
+/// e.g. "SPS(7) PPS(8) IDR(5)" or "SLICE(1) SLICE(1)".  Used in diagnostics only.
+fn nal_type_summary(data: &[u8]) -> String {
+    let mut types = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let sc_len = if data.get(i..i + 4) == Some(&[0, 0, 0, 1]) {
+            4usize
+        } else if data.get(i..i + 3) == Some(&[0, 0, 1]) {
+            3usize
+        } else {
+            i += 1;
+            continue;
+        };
+        let nalu = i + sc_len;
+        if nalu < data.len() {
+            let t = data[nalu] & 0x1F;
+            let name = match t {
+                1 => "SLICE",
+                5 => "IDR",
+                6 => "SEI",
+                7 => "SPS",
+                8 => "PPS",
+                _ => "?",
+            };
+            types.push(format!("{name}({t})"));
+        }
+        i = nalu + 1;
+    }
+    if types.is_empty() { "none".into() } else { types.join(" ") }
 }
 
 /// Scan an Annex B bitstream for the first IDR slice NAL (type 5) and return
