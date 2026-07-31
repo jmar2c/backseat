@@ -7,12 +7,6 @@
 # Pre-built FFmpeg dev package (downloaded by scripts/setup-ffmpeg.ps1 on Windows)
 /vendor/
 **/*.rs.bk
-Cargo.lock
-
-# Node
-client/node_modules
-client/dist
-client/.vite
 
 # Env
 .env
