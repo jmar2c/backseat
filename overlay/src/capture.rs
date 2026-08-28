@@ -2,7 +2,7 @@
 //!
 //! On Windows this uses the Windows Graphics Capture API (WGC), which works in
 //! remote-access sessions (Chrome Remote Desktop, RDP, etc.) unlike the older
-//! DXGI OutputDuplication used by `scrap`.  On Linux it uses XCB.
+//! DXGI OutputDuplication this crate replaced.  On Linux it uses XCB.
 
 use screenshots::Screen;
 
@@ -33,10 +33,15 @@ impl ScreenCapture {
     }
 
     /// Capture the current frame.  Returns `Ok(Some(rgba))` on success or
-    /// `Err` on failure (e.g. display removed, resolution changed mid-session).
-    /// `Ok(None)` is never returned — unlike scrap there is no WouldBlock concept.
+    /// `Err` on failure (e.g. display removed).  `Ok(None)` is never returned —
+    /// there is no WouldBlock concept here.
     ///
     /// Output bytes are RGBA as produced by the screenshots crate.
+    ///
+    /// Note: a resolution change mid-session does *not* produce an `Err`.  The
+    /// capture succeeds and simply returns a buffer of the new size, so callers
+    /// must compare the length against the dimensions they expect rather than
+    /// relying on an error to signal the change.
     pub fn capture(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
         self.screen
             .capture()
