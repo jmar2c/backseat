@@ -1856,7 +1856,11 @@ fn apply_annot(
             c.update(UserId(src_id), *pos);
         }
         AnnotMsg::StrokeBegin { stroke_id, pos, width, color, alpha } => {
-            let color = color.chars().take(7).collect::<String>();
+            // Reject malformed colours outright rather than truncating: the old
+            // `chars().take(7)` capped characters, not bytes, so a multi-byte
+            // string still reached the painter and panicked it.
+            let color = crate::renderer::sanitize_hex_color(color)
+                .unwrap_or_else(|| "#ffffff".to_string());
             let width = width.clamp(0.5, 50.0);
             draws.lock().unwrap().begin_stroke(UserId(src_id), *stroke_id, *pos, width, color, *alpha);
         }

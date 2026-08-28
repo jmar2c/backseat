@@ -20,9 +20,17 @@ pub fn hex_to_color32(hex: &str) -> Color32 {
     hex_to_color32_alpha(hex, 255)
 }
 
+/// Parse `rrggbb` or `#rrggbb` into a colour, falling back to white.
+///
+/// Stroke colours arrive over the wire from viewers, so this runs on
+/// attacker-controlled input inside the paint loop and must never panic.
+/// `h.len()` counts bytes while `&h[0..2]` needs a char boundary, so the
+/// ASCII-hex check is what keeps the slices below sound — without it a
+/// multi-byte character such as `"aébcd"` is 6 bytes long and splits
+/// mid-codepoint.
 pub fn hex_to_color32_alpha(hex: &str, alpha: u8) -> Color32 {
     let h = hex.trim_start_matches('#');
-    if h.len() == 6 {
+    if h.len() == 6 && h.bytes().all(|c| c.is_ascii_hexdigit()) {
         if let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&h[0..2], 16),
             u8::from_str_radix(&h[2..4], 16),
@@ -32,6 +40,18 @@ pub fn hex_to_color32_alpha(hex: &str, alpha: u8) -> Color32 {
         }
     }
     Color32::WHITE
+}
+
+/// Normalise a viewer-supplied colour to canonical `#rrggbb`, or `None` if it
+/// is not a valid hex colour.
+///
+/// Applied at the host's trust boundary in `apply_annot` so malformed or
+/// oversized colour strings are rejected on arrival rather than stored and
+/// re-parsed on every frame.
+pub fn sanitize_hex_color(hex: &str) -> Option<String> {
+    let h = hex.trim_start_matches('#');
+    (h.len() == 6 && h.bytes().all(|c| c.is_ascii_hexdigit()))
+        .then(|| format!("#{}", h.to_ascii_lowercase()))
 }
 
 /// Paint assembled stickers on the host's transparent overlay.
@@ -174,6 +194,69 @@ pub fn paint(
                 egui::FontId::proportional(13.0),
                 Color32::WHITE,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_parses_valid_colours_with_and_without_hash() {
+        assert_eq!(hex_to_color32("#ff8000"), Color32::from_rgb(255, 128, 0));
+        assert_eq!(hex_to_color32("ff8000"),  Color32::from_rgb(255, 128, 0));
+        assert_eq!(hex_to_color32("AABBCC"),  Color32::from_rgb(170, 187, 204));
+    }
+
+    #[test]
+    fn hex_applies_alpha() {
+        assert_eq!(
+            hex_to_color32_alpha("#ff8000", 128),
+            Color32::from_rgba_unmultiplied(255, 128, 0, 128),
+        );
+    }
+
+    /// A viewer-supplied colour must never panic the host's paint loop.
+    /// `"aébcd"` is 5 chars but 6 bytes, so the old byte-length check passed
+    /// and `&h[0..2]` split the `é` mid-codepoint.
+    #[test]
+    fn hex_rejects_multibyte_string_of_six_bytes() {
+        assert_eq!(hex_to_color32("aébcd"), Color32::WHITE);
+        assert_eq!(hex_to_color32("#aébcd"), Color32::WHITE);
+        assert_eq!(hex_to_color32("é" .repeat(3).as_str()), Color32::WHITE);
+    }
+
+    #[test]
+    fn hex_rejects_wrong_length_and_non_hex() {
+        for bad in ["", "#", "fff", "ff80000", "gggggg", "ff 000", "../../x"] {
+            assert_eq!(hex_to_color32(bad), Color32::WHITE, "{bad:?} should fall back");
+        }
+    }
+
+    #[test]
+    fn sanitize_normalises_valid_colours() {
+        assert_eq!(sanitize_hex_color("#FF8000").as_deref(), Some("#ff8000"));
+        assert_eq!(sanitize_hex_color("ff8000").as_deref(),  Some("#ff8000"));
+    }
+
+    #[test]
+    fn sanitize_rejects_what_the_parser_would_reject() {
+        for bad in ["aébcd", "", "fff", "gggggg", &"z".repeat(10_000)] {
+            assert_eq!(sanitize_hex_color(bad), None, "{bad:?} should be rejected");
+        }
+    }
+
+    /// The trust boundary and the painter must agree: sanitising never changes
+    /// the colour, and its output is stable under re-sanitising.  Compared
+    /// against the parse of the original rather than against `WHITE`, since
+    /// white is both a legitimate colour and the parser's failure value.
+    #[test]
+    fn sanitize_preserves_colour_and_is_idempotent() {
+        for good in ["#ff8000", "AABBCC", "000000", "ffffff"] {
+            let s = sanitize_hex_color(good).expect("should be accepted");
+            assert_eq!(hex_to_color32(&s), hex_to_color32(good), "{good:?} changed colour");
+            assert_eq!(sanitize_hex_color(&s).as_deref(), Some(s.as_str()));
         }
     }
 }
