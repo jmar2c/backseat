@@ -21,6 +21,7 @@ if ! command -v apt-get &>/dev/null; then
     exit 1
 fi
 
+sudo apt-get update
 sudo apt-get install -y \
     libdbus-1-dev \
     libopus-dev \
@@ -35,6 +36,9 @@ rustup target add x86_64-pc-windows-gnu
 
 echo ""
 echo "Done."
-echo "  Linux binary:  cargo build -p overlay"
-echo "  Windows binary: cargo build -p overlay --target x86_64-pc-windows-gnu"
+echo "  Linux binary:   cargo build -p overlay"
+echo "  Windows binary: ./scripts/cross-windows.sh --release"
+echo ""
+echo "Note: cargo cannot cross-compile for Windows on its own — build.rs requires FFMPEG_DIR,"
+echo "which cross-windows.sh sets after building FFmpeg and x264 for the MinGW target."
 echo "(First run compiles FFmpeg from source, ~10 min; cached on subsequent builds.)"
