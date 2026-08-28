@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::audio::{AudioCapture, AudioPlayer, AudioSource};
 use crate::sticker_layer::{
     AssembleResult, HostSticker, HostStickerEntry, StickerReassembler,
-    ViewerSticker, ViewerStickerLayer, MAX_STICKERS_PER_VIEWER,
+    ViewerSticker, ViewerStickerLayer, MAX_STICKERS_PER_VIEWER, PENDING_TIMEOUT,
 };
 
 // cpal::Stream is !Send, so AudioCapture and AudioPlayer cannot be moved into
@@ -1279,7 +1279,7 @@ impl OverlayApp {
                                         Packet::ImageChunk { sticker_id, total, idx, crc32, data } => {
                                             if let Some(peer) = peers.get(&src) {
                                                 let viewer_id = peer.viewer_id;
-                                                let result = reassembler.push_chunk(sticker_id, total, idx, crc32, data);
+                                                let result = reassembler.push_chunk(sticker_id, total, idx, crc32, data, viewer_id);
                                                 handle_assemble(result, sticker_id, viewer_id, &sticker_tx, &mut sticker_counts.lock().unwrap());
                                             }
                                         }
@@ -1366,6 +1366,14 @@ impl OverlayApp {
                             }
 
                             _ = nack_tick.tick() => {
+                                // Sweep first: a transfer past the deadline is dead, and
+                                // NACKing it every tick wastes bandwidth as well as memory.
+                                for (sticker_id, owner) in reassembler.sweep_stale(PENDING_TIMEOUT) {
+                                    tracing::warn!(
+                                        "sticker {sticker_id} from {owner} incomplete after {}s — dropping",
+                                        PENDING_TIMEOUT.as_secs(),
+                                    );
+                                }
                                 for (sticker_id, owner, missing) in reassembler.collect_nacks() {
                                     if let Some((&addr, _)) = peers.iter().find(|(_, p)| p.viewer_id == owner) {
                                         let _ = transport.send_image_nack(addr, sticker_id, &missing).await;

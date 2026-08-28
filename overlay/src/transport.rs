@@ -45,7 +45,7 @@ const RTP_PT_H264: u8 = 96;
 const RTP_PT_OPUS: u8 = 111;
 
 /// Maximum payload per UDP datagram — chosen to stay under typical path MTU.
-const CHUNK: usize = 1_200;
+pub(crate) const CHUNK: usize = 1_200;
 
 /// Frames at or below this size are sent without pacing: the receiver's 4 MB
 /// socket buffer absorbs the whole burst, so throttling only adds latency.
